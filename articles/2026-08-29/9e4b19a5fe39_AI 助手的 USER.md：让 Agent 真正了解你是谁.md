@@ -1,115 +1,116 @@
 ---
 title: AI 助手的 USER.md：让 Agent 真正了解你是谁
-feedId: 35121
+feedId: 35126
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
 
+# AI 助手的 USER.md：让 Agent 真正了解你是谁
+
 ## 背景
 
-在 OpenClaw 这类 Agent 工作流里，项目级配置越来越常见：`AGENTS.md`、`CLAUDE.md` 会告诉 Agent 当前仓库怎么构建、测试命令是什么、哪些目录不要碰。但有一个空白很少被认真对待：Agent 不了解“你”是谁。
-
-它不知道你的默认 shell、常用编辑器、工作目录习惯、哪些操作需要先确认、哪些依赖已经装好。于是每次开新会话，你都要重复说明；多个 Agent 并行执行时，还会出现彼此不一致的理解。项目文档解决的是“这个项目应该怎么做”，而用户级上下文解决的是“这个人希望怎么做”。
+在 OpenClaw、MCP 和插件自动化场景里，我们希望 agent 不只是执行单次指令，而是能按你的习惯工作：用哪个 shell、代码风格、目录结构、哪些命令禁止、哪些 MCP 工具优先。现实是，这些信息散落在每次对话里，换会话就丢。对个人用户来说，最轻量可控的落地方式不是再上一套复杂记忆系统，而是维护一个 `USER.md`。
 
 ## 问题
 
-自动化任务失败，很多时候不是因为模型能力不够，而是因为 Agent 在错误的环境假设下工作。
+没有 `USER.md` 时，常见现象：
 
-几个典型场景：
+- agent 默认用 `python` 而不是 `python3`，或执行了高风险命令；
+- 每次新任务都要重复“我的环境是……”“不要动某个目录”；
+- agent 调用 MCP 工具时选择很随机，缺少个人偏好约束；
+- 聊天记录越堆越长，看似有记忆，但不可复用、不可审计。
 
-- 你常用 `fish`，但 Agent 默认生成 `bash` 脚本；
-- 你的项目根目录在 `~/work`，Agent 默认去找 `~/projects`；
-- 你用 `pnpm`，Agent 按 `npm` 生成命令；
-- Agent 自动执行了 `git push --force`，但你的底线是强制推送前必须先确认；
-- 多个 MCP server 或子 Agent 读取用户环境时，各自猜测，导致行为不一致。
+`USER.md` 不是万能记忆，而是一份稳定、短小、可加载的个人运行上下文。
 
-上下文缺失不只会带来返工，还可能带来实际风险。
+## 做法 / 步骤
 
-## 做法
+### 1. 控制边界：只写稳定信息
 
-### 1. 建立用户级 USER.md
+`USER.md` 只放三类内容：
 
-建议放在固定路径，例如：
+- **事实**：OS、常用路径、时区、编辑器、主力语言、硬件限制；
+- **偏好**：命令风格、输出语言、commit 风格、日志级别、是否自动确认；
+- **禁止**：不允许删除、不允许访问的目录、不允许联网查询的域名、不允许在未备份前修改的文件。
 
-```text
-~/.openclaw/USER.md
-```
+敏感信息不要写入，包括 token、密码、私钥、cookie。
 
-不要在项目里散落多份用户偏好。用户级信息应当只有一个权威来源。
+### 2. 选择加载位置
 
-### 2. 内容分块
+在 OpenClaw 里，建议建两个层级：
 
-USER.md 不用写成自传，重点放跨项目、稳态、可执行的信息。我实际使用的结构如下：
+- 全局：`~/.openclaw/USER.md`，跨项目不变的偏好；
+- 项目：`.openclaw/USER.md`，项目相关路径、命令、MCP 工具选择。
+
+然后让 agent 在冷启动或首次执行前读取。不同执行器的接入点不同：有的是 system prompt 静态注入，有的是通过 MCP resource 暴露，有的需要插件在会话创建时读取。选择哪种取决于上下文窗口大小和隐私要求。
+
+### 3. 写一个可执行模板
 
 ```markdown
-# Identity
-- 称呼：xxx
-- 常用语言：中文 / English
-- 角色：后端 / 自动化维护
+# USER.md
 
-# Environment
-- OS: macOS
-- Shell: fish
-- Editor: Neovim
-- Package manager: pnpm
+## 事实
+- OS: macOS 14 / Debian 12
+- Shell: zsh
+- Editor: nvim
+- Timezone: Asia/Shanghai
+- Python: 优先 python3.11
 
-# Workspace
-- 主目录：~/work
-- 活跃项目：openclaw-runtime, mcp-bridge
-- 实验目录：~/lab
+## 偏好
+- 输出使用简体中文，技术术语保留英文
+- 命令先给 dry-run，再执行
+- 文件操作前先备份到 /tmp/oc-backup/
 
-# Permissions
-- 以下操作必须先输出计划并等待确认：
-  - rm -rf / git push --force
-  - 数据库 schema 变更
-  - 安装全局依赖
-
-# Preferences
-- 脚本默认给 fish，除非项目另有要求
-- 日志输出使用英文，注释使用中文
-- 变更前先给 diff 或计划
+## 禁止
+- 不执行 rm -rf
+- 不读取 ~/.ssh/ 下任何文件
+- 不访问生产环境数据库，除非显式要求并提供连接标识
 ```
 
-### 3. 注入方式
+控制在 150 行以内。每一行都应该能在某个任务里直接影响 agent 的下一步动作。太像自我介绍但没约束力的内容可以删。
 
-OpenClaw 可以在全局配置里把 USER.md 作为基础指令引入。如果支持 MCP resource，也可以把该文件暴露为一个 resource，让 Agent 按需读取，而不是把全文塞进 system prompt。
+### 4. 拆分配置，按需加载
 
-我目前的做法是：全局配置中仅注入一句“用户级上下文见 `~/.openclaw/USER.md`，初始化任务时先读取”。这样可以减少固定 token 占用。
+不要每次把整份 `USER.md` 全部塞进 prompt。可以拆成：
 
-### 4. 与项目级文档分层
+- `profile.md`：环境事实；
+- `preferences.md`：工作偏好；
+- `constraints.md`：安全边界。
 
-项目级 `AGENTS.md` 依然是最高优先级。USER.md 只描述跨项目稳定偏好，不要重复项目细节。项目文档和用户文档冲突时，应当默认项目文档优先，并在 USER.md 中明确声明这一点。
+首次会话只加载 profile 的摘要，agent 遇到相关动作时再读取对应文件。这样既省 token，也避免长上下文后半段被忽略。
+
+### 5. 建立更新闭环
+
+每两周或每次踩坑后回看：哪些信息 agent 反复问？哪些偏好它没遵守？把重复澄清的内容写回 `USER.md`。一个简单方法是在 agent 配置里加入提醒：任务结束前，若有信息值得沉淀，建议追加到 `USER.md`。
 
 ## 踩坑点
 
-- **不要把秘密写进 USER.md**：API key、token、内部跳板机地址都不要出现。需要引用时只写环境变量名，例如 `$STAGING_TOKEN`，不写值。
-- **内容膨胀**：把一次性任务、临时调试记录、当天心情写进去，很快会变成噪音。USER.md 应该像 `.bashrc` 一样克制，只保留长期有效信息。
-- **路径跨平台不一致**：`~` 在 Windows 和 macOS/Linux 下展开结果不同。多平台用户建议写环境变量，或明确标注平台分支。
-- **项目级冲突**：如果 USER.md 写“默认 pnpm”，项目强制要求 npm，Agent 可能犹豫或选错。需要在文档中写清优先级，例如“当项目级 AGENTS.md 有明确工具链要求时，以项目为准”。
-- **隐私泄露**：USER.md 如果被 MCP server 或插件上传到第三方服务，可能暴露你的目录结构、项目名称、工作习惯。不要把公司内部敏感信息放进去，必要时限制 Agent 可访问的用户目录范围。
-- **多机不同步**：放 dotfiles 仓库是好习惯，但不同机器环境不同。建议为机器差异留条件块，或用环境变量区分。
+- **把 USER.md 当博客写**：写到 500 行，agent 实际只读了前 80 行。
+- **信息矛盾**：全局 `USER.md` 和项目 `AGENTS.md` 同时定义了 python 版本，agent 按顺序取了错误的一个。需要明确优先级，例如项目级 > 全局。
+- **泄漏风险**：通过 MCP filesystem 工具读取 `USER.md` 时，可能被第三方 MCP server 记录完整路径；不要在文件里放敏感字段。
+- **环境漂移**：换机器后 `USER.md` 里的路径还是旧 Mac 的，agent 在 Linux 上找不到，报错后可能自行猜测补全，导致更糟结果。
+- **过度约束**：把“不要解释太多”写成“少说话”，agent 可能在需要确认风险时也直接执行。
+- **误提交敏感内容**：把 `USER.md` 写进项目提交但忘记排除敏感项。建议用 env var 注入敏感值，文件本身只写占位符。
 
 ## 可复用建议
 
-- 使用 frontmatter 标注更新时间、适用范围，便于脚本解析；
-- “必须确认”清单比泛化的“请谨慎操作”更有效，给 Agent 明确可执行的边界；
-- 定期清理，建议每月检查一次，删除过期路径和不再使用的偏好；
-- 如果 Agent 支持工具调用，可以让它通过工具读取 USER.md，而不是把全文常驻 system prompt；
-- 将 USER.md 视为配置代码：有版本、有结构、有边界，而不是随手写的一段说明。
+- 用“事实-偏好-禁止”三段式，每条不超过两行。
+- 给 agent 一个固定加载入口：新会话先读 `USER.md`，再开始任务。
+- 在 `USER.md` 顶部写优先级说明：本文件优先级高于默认行为，低于项目 `AGENTS.md`/显式指令。
+- 做一次冒烟测试：新环境里问 agent “我的默认 shell 是什么？有哪些禁止操作？” 如果答错，说明加载失败或文件被截断。
+- 把 `USER.md` 纳入配置管理，但不要放 secrets；敏感项用 `${ENV_VAR}` 占位，由启动脚本注入。
+- 如果你的 MCP 支持 resource，优先用 resource 暴露 `USER.md`，而不是在每次 system prompt 里重复粘贴。
 
 ## 总结
 
-USER.md 解决的不是 Agent“会不会”，而是“懂不懂你”。它把重复的自我介绍、环境说明、权限底线沉淀成一份稳态用户上下文，降低每次会话的沟通成本，也减少多 Agent 协作时的理解偏差。
-
-写好 USER.md 的关键不是写得多，而是分层清晰、边界明确、像代码一样持续维护。它不适合承载临时信息，也不应该成为秘密仓库。把它当作 Agent 的“用户配置文件”，自动化才会越来越像你的助手，而不是一个每次都从零开始猜你习惯的陌生人。
+`USER.md` 的价值不在“让 agent 更像你”，而在减少重复澄清和不一致操作。它应该是一个小型的、可复现的运行配置：稳定、精简、有明确优先级、有更新机制。对 OpenClaw/Agent/MCP 用户来说，这比堆更多插件或更复杂的 memory 系统更可控，也更适合长期维护。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/5ac0f134554ae9fd.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/74e5541acf7913ff.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/fcb66405af593bc4.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/83fde889556e41d3.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/dc9b4c5c2efa7f0c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/833da45ec7ac0ae6.png)
 
