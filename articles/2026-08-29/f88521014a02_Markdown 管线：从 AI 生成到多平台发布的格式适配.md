@@ -1,87 +1,79 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 35188
+feedId: 35189
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
 
+# Markdown 管线：从 AI 生成到多平台发布的格式适配
+
 ## 背景
 
-在 OpenClaw 这类 Agent 工作流中，AI 生成的内容大多以 Markdown 输出。但 Markdown 只是中间格式，并不等于各平台可发布的最终格式。公众号、知乎、掘金、GitHub、Notion 对标题层级、代码块、公式、表格、图片链接、front matter 的处理差异很大。如果每个任务都各自做格式调整，会出现同一个内容反复手动修改、Agent 输出不稳定、发布结果不可预期的问题。
+在 OpenClaw 的 Agent 工作流里，让模型生成 Markdown 内容并不难，难的是把同一份内容发布到公众号、知乎、掘金、Notion、GitHub 等平台时，各家对 Markdown 的支持差异会直接破坏排版。如果让 Agent 在提示词里记住每个平台的规则，不仅 context 膨胀，输出也会不稳定。更可靠的做法是把“生成”和“适配”拆开：固定一份 canonical Markdown，再交给确定性的 adapter 转成平台格式。
 
 ## 问题
 
-AI 原始 Markdown 常见的问题包括：多了一层 ````markdown` 外层围栏；front matter 被平台当成正文；图片使用本地相对路径或不可外链的原始 URL；代码块缺少语言标注；嵌套列表使用 Tab 或 4 空格导致不同平台渲染不一致；表格对齐不规范；脚注、任务列表、raw HTML 等非标准语法在部分平台不支持。这些问题如果直接在发布前人工处理，成本高且容易遗漏。
+AI 生成的 Markdown 通常有几个典型问题：
 
-## 做法 / 步骤
+- 代码块反引号数量不一致，代码内容里出现 ``` 时容易闭合错位。
+- 列表、引用之间的空行和缩进随机，导致不同渲染器结果不一致。
+- 习惯性使用脚注、mermaid 图、任务列表，但很多内容平台并不支持。
+- 标题层级跳跃、表格列过宽、外链图片被盗链。
+- 把平台差异写进提示词，会让模型输出不稳定，也无法复用。
 
-### 1. 约束生成
+这些问题的本质不是“模型不够强”，而是格式规则应当由确定性代码处理，而不是由生成模型临场决策。
 
-给 Agent 的 system prompt 或工具描述中明确输出契约：只输出纯 Markdown 正文，不要外层代码围栏；front matter 仅允许 `title`、`summary`、`tags`、`slug` 等字段；图片使用可访问的 https URL 或统一占位符；标题从二级开始；列表缩进统一 2 空格；代码块必须带语言标注。
+## 做法/步骤
 
-这样做比事后清洗更可靠，因为 Agent 在生成时就能遵守边界。
+### 1. 定义 single source of truth
 
-### 2. 解析与校验
+先固定 canonical Markdown 子集：只保留标题、段落、有序/无序列表、引用、代码块、链接、图片、表格、分割线。禁用 HTML 块、脚注、mermaid、任务列表等平台兼容性差的语法。用 markdownlint 配置锁住规则，例如 MD001、MD009、MD031、MD040、MD041，保证每次生成都经过同一套校验。
 
-用 unified/remark 或 markdown-it 将 Markdown 解析成 AST，不建议使用正则处理 Markdown。校验规则可以包括：
+### 2. 生成侧约束
 
-- 顶层只有一个 H1 或没有；
-- 所有图片有 alt 和 https 源；
-- 所有链接为绝对 URL 或内部锚点；
-- front matter 能被正确解析；
-- 代码块有语言字段；
-- 禁止未转义的 raw HTML 和不支持的脚注语法。
+在 Agent system prompt 里给出 canonical 规范和反例，要求模型只输出该子集。生成后先调用 MCP 工具 `validate_markdown`，校验失败时把 markdownlint 输出作为 feedback 让模型重试。这样模型只负责内容，不负责平台适配。
 
-校验失败时返回结构化错误信息，让 Agent 重写或自动修复，而不是直接进入发布流程。
+### 3. AST 适配层
 
-### 3. 平台 profile 适配
+不要用正则处理 Markdown。用 unified/remark 生态解析成 AST，按平台规则 transform，再用 remark-stringify 统一空行和列表缩进。每个平台一个 adapter：
 
-为每个平台定义独立的转换规则，例如：
+- **公众号**：Markdown 转行内样式 HTML；代码块转带背景的 `<pre>`；表格根据列宽决定保留或转列表。
+- **知乎**：补齐代码块语言标注；清理外链图片；严格处理列表空行。
+- **掘金**：单独注入 frontmatter；处理摘要分隔与标签。
+- **Notion**：标题从 H2 开始，避免 H1；移除脚注等不支持的语法。
 
-- **公众号**：剥离 front matter；代码块转成带样式的区块或纯文本；宽表格转 HTML 或图片；图片必须上传到素材库并替换 URL；不支持脚注，转为括号注释。
-- **知乎**：公式需要转图片或使用知乎支持的格式；代码块保留 GFM；表格要检查移动端宽度。
-- **掘金 / GitHub**：支持 GFM、任务列表和表格，但需要处理 front matter 和标题锚点。
-- **Notion**：转换为 blocks 或 markdown 导入格式；注意 Notion 对多级代码块高亮支持有限，可能需要拆分。
+### 4. 接入 OpenClaw
 
-平台差异不应该散落在脚本各处，而应集中到 profile 配置中。
-
-### 4. 发布执行
-
-可以通过 MCP server 暴露 `publish` 工具，Agent 调用时传入 profile 和最终 Markdown。内部先做 dry run，生成预览 diff，确认后调用平台 API 或剪贴板导入。发布结果写回 Markdown 的 front matter，追加 `platform_links` 字段，生成发布报告。
-
-### 5. 失败处理
-
-平台 API 限流、图片上传失败、登录态过期等情况需要重试和告警。原始 Markdown 必须保留，避免发布失败后无法重发。
+在插件里暴露三个工具：`validate_markdown`、`transform_for_platform`、`preview_diff`。Agent 生成内容后先 validate，通过后 transform，发布前用 preview_diff 查看转换前后差异。转换产物落盘保存，便于发布后出问题时回滚。
 
 ## 踩坑点
 
-- 直接对 Markdown 做字符串替换很容易破坏链接、代码块和表格。比如把标题前的 `#` 与代码块中的 `#` 混淆。必须基于 AST 节点处理。
-- 外层 ````markdown` 围栏很常见。剥离时要判断首尾 token，不能误删内部代码块围栏。
-- front matter 不是标准 Markdown 的一部分，很多平台会原样显示。转换前要显式剥离，并把 `title` 等字段映射到平台自己的标题字段。
-- 图片外链容易被防盗链或过期。统一图床 + 上传后替换 URL，不要依赖 AI 给出的原始 URL。
-- 公式处理成本最高：知乎和公众号对 LaTeX 渲染支持有限。最好在生成阶段就要求 AI 避免复杂数学公式，或使用图片替代。
-- 代码块语言标注丢失在公众号尤其明显，需要提前检查并转换成可读文本。
-- 平台间表格样式差异大，宽表格在移动端会被截断。可在转换时设置最大列数或转图片。
+- **正则解析 Markdown 基本不可靠**：代码块里的 `#`、链接中的括号、嵌套列表都会误判。务必走 AST。
+- **公众号不是标准 Markdown 解析器**：直接粘贴代码块和表格会乱。尤其代码内容中出现连续反引号时，不能简单合并反引号，需要根据内容中最长连续反引号数量选择更长的围栏，或者将内容转成 HTML 实体。
+- **表格在移动端容易溢出**：公众号、Notion 移动端最好转成列表或提前截断列。
+- **AI 经常出现标题跳级**：例如 H2 直接到 H4。canonical 校验应禁止标题层级跳变。
+- **frontmatter 不是所有平台都支持**：关键信息不要只放在 canonical 的 frontmatter 里，adapter 按平台单独添加。
+- **外链图片可能被平台屏蔽**：发布前需要将图片转存到平台素材库或多平台 CDN。
 
 ## 可复用建议
 
-- 固定 Markdown 子集，超出子集的语法在入口就拦截，避免生成后再修。
-- 维护平台 profile 配置，新增平台只加配置和少量转换函数，不改主流程。
-- 提供 MCP 工具接口，让 Agent 可以在一次 tool call 内完成校验、转换、发布。
-- 发布前永远有 dry run 和 diff，可以看到每个平台的最终效果。
-- 保留源 Markdown 和每次转换后的产物，方便回滚和审计。
+- 把 adapter 写成独立 package，每个平台保存 input/output 样例。
+- 回归测试用 golden files：为每个平台保存期望输出，改动后直接 diff。
+- 发布前跑 pre-commit：markdownlint + 自定义规则，不通过不允许 transform。
+- 保持规则确定性，不让模型参与平台适配。模型只负责内容，格式交给代码。
+- MCP 工具返回结构化结果：`{platform, ok, errors, output, diff}`，方便 Agent 根据错误分支处理。
 
 ## 总结
 
-Markdown 管线解决的不是简单的“格式转换”，而是降低 AI 生成内容到多平台发布的不可控性。通过约束输出、AST 校验、profile 适配和发布回写，可以把返工从每次手动处理变成一次配置。对 OpenClaw / Agent / MCP 用户来说，这条管线更适合作为可复用工具链，而不是一次性脚本。
+Markdown 管线不是一堆正则替换堆叠，而是“单一源规范 + AST 适配层 + 回归测试”。在 OpenClaw 里把生成与格式解耦，可以有效降低 AI 输出的随机性，让多平台发布从反复调格式变成可复现的工程流程。平台差异交给 adapter，内容生成交给模型，两边都不越界，管线才能长期维护。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/b685b170912aa721.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/fd88d35288dccb7a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/1df2526afe88a3fd.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/37df9fdbe24bc3e2.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/0909f55d122d5f20.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/548f681cb3fa014a.png)
 
