@@ -1,117 +1,115 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 35267
+feedId: 35300
 source: 综合讨论
 publishedAt: 2026-08-30
 ---
 
 ## 背景
 
-OpenClaw 在处理自动化任务时，默认依赖每次会话的上下文。任务一结束，很多关键信息就会丢失：偏好的工具链、环境中不能碰的路径、输出格式约定、已经踩过的坑。下次再跑类似任务，又得重新交代一遍。
+OpenClaw 经常被当作个人助理、自动化执行器，同时接入 MCP、文件系统、脚本、浏览器等能力。工具越多，会话越容易漂移。与其把角色设定、语气、工具偏好、安全边界全部堆在 system prompt 里，不如放进一个专门的身份文件：`IDENTITY.md`。
 
-把这类信息写进 system prompt 能解决一部分问题，但很快会膨胀，而且 agent 无法在运行过程中沉淀新的经验。IDENTITY.md 的思路，就是给 OpenClaw 一个持久的、可被读取、也能在受控条件下回写的身份文件。它不是记忆库，而是一个可进化的接口。
+这个文件不一定需要复杂机制。它更像一个运行基线：让 agent 在每次启动、切换 MCP server 或进入新任务前，先知道自己是谁、能做什么、不能做什么。
 
 ## 问题
 
-如果直接把 IDENTITY.md 当成“让 AI 随便记”，通常会把事情搞糟：
+1. **系统提示词膨胀**：角色说明、风格要求、权限边界、示例全混在一起，越改越难维护。
+2. **跨会话行为漂移**：这轮像执行器，下轮像搜索引擎，输出风格不稳定。
+3. **没有持久身份**：MCP 工具或插件上下文切换后，模型丢失原来的工作约定。
+4. **更新靠手改**：Agent 不能从错误中沉淀规则，所有身份调整都依赖人工编辑。
 
-- **上下文膨胀**：无限制追加内容，最终超过模型有效窗口。
-- **写入污染**：agent 把一次性结论当成长期规则写进去。
-- **文件分裂**：全局和项目级各写一份，实际加载哪份不稳定。
-- **并发冲突**：多个 agent 同时写，后写覆盖先写。
+## 做法/步骤
 
-因此，更可靠的思路是：给身份文件加结构，并限制 agent 只能写哪些部分。
+### 1. 建立最小身份文件
 
-## 做法与步骤
-
-### 1. 建立最小结构
-
-我建议把 IDENTITY.md 控制在固定骨架内。一个可用的最小结构如下：
-
-```markdown
----
-role: automation_agent
-last_updated: 2026-04-12
----
-
-# Role
-负责在仓库中执行自动化任务，不做未经确认的破坏性操作。
-
-# Constraints
-- 不修改 build/ 目录。
-- 不直接推送到 main 分支。
-- 所有命令使用非交互模式。
-
-# Workspace
-默认运行在 `~/projects/repo`。
-
-# Known Issues
-- ...
-
-# Evolution Log
-- 2026-04-12: 遇到依赖版本冲突，使用 lock 文件解决。
-```
-
-核心原则是：**Role、Constraints、Workspace 稳定不变；Known Issues 和 Evolution Log 允许演进。**
-
-### 2. 在启动模板中挂载
-
-在 OpenClaw 的配置文件中显式指定身份文件，而不是四处散布。示例：
+建议使用 YAML front matter 存结构化字段，正文只放不可变身份说明。保持文件在 200 行以内。
 
 ```yaml
-identity:
-  file: .openclaw/IDENTITY.md
-  auto_update: true
-  allowed_sections: ["evolution_log", "known_issues"]
-  max_entries_per_run: 2
-  entry_max_chars: 500
-  lock_file: .openclaw/.identity.lock
+---
+name: openclaw-agent
+version: 7
+updated: 2025-01-01
+role: personal automation assistant
+tone: concise, engineering-oriented
+boundaries:
+  - never expose absolute paths
+  - ask before destructive file operations
+tools:
+  preferred: [fs, mcp-fetch]
+  avoid: []
+memory:
+  facts_dir: .openclaw/memory/facts.md
+  prefs_dir: .openclaw/memory/prefs.md
+---
 ```
 
-启动时只加载 Role、Constraints 和最近若干条 Evolution Log，完整文件仅在需要检索时读取。这能避免上下文被无意义的历史信息占满。
+正文只写身份说明，例如“你是 OpenClaw 的本地自动化助手，优先使用只读工具，遇到高风险操作先确认。”
 
-### 3. 限制写入权限
+### 2. 会话启动时注入
 
-不要让 agent 直接编辑整个文件。只允许它追加到白名单区域，并规定格式：
+OpenClaw 启动后先读取 `IDENTITY.md`，再加载本次任务上下文。可以简单用脚本输出：
 
-- 每条经验必须包含日期、触发场景、解决方式。
-- 单次运行最多追加 2 条。
-- 不允许改动 Role、Constraints、Workspace。
-- 写入前先做格式校验，失败则不落盘。
+```bash
+cat .openclaw/IDENTITY.md
+```
 
-这样 agent 能沉淀经验，又不会把身份文件写乱。
+如果通过 MCP 暴露，建议挂载为只读 resource。不要把身份文件放在任意可写目录，否则容易被误改。
 
-### 4. 版本化与校验
+### 3. 设计可进化的更新规则
 
-把 IDENTITY.md 纳入 Git 管理，每次自动写入生成一个 commit。配合简单校验脚本检查 frontmatter、必需 section 和时间戳格式。这样即使某次写入有问题，也能快速回滚。
+不建议让模型直接覆盖身份文件。更好的方式是“提议—确认—合并”：
+
+- 模型输出 YAML patch
+- 只允许修改白名单字段：`role`、`tone`、`boundaries`、`tools`、`memory`
+- 变更原因写入 `CHANGELOG.md`
+- 版本号 +1
+
+这样身份可以进化，但每次变更都可审计、可回滚。
+
+### 4. 分离动态记忆与静态身份
+
+身份不应该频繁变化，事实和偏好才需要更新。把动态记忆放到 `facts.md`、`prefs.md`，身份文件只引用路径。不要把聊天记录、临时任务写进 `IDENTITY.md`。
+
+### 5. 加自检
+
+每次身份更新后，跑几个固定问题：
+
+- 你是谁？
+- 遇到未知工具是否先确认？
+- 是否会泄露本地路径？
+- 输出语气是否稳定？
+
+符合预期再保留版本。
 
 ## 踩坑点
 
-- **整文件塞进提示词**：身份文件一变大，启动上下文就超限。只加载关键段和最近条目。
-- **偶发问题被写成规律**：某次网络失败可能不是稳定现象。建议先开 dry-run，让 agent 只输出拟写入内容，人工确认后再放开自动写入。
-- **路径不一致**：固定唯一身份文件，优先使用 `.openclaw/IDENTITY.md`，并在配置中显式声明，不要同时维护全局和项目级两个版本。
-- **并发写覆盖**：使用 append-only + lock 文件，或通过 Git 提交作为串行化层。
-- **格式漂移**：没有校验脚本时，几次自动写入后格式就会变得不可解析。
+- **身份文件过长**：超过 300 行后，模型容易忽略尾部。拆成 identity、runtime profile、memory。
+- **允许直接覆盖**：模型可能把一次错误策略写进身份。必须经过 diff 或 allowlist 确认。
+- **把 secrets 写进去**：token、密码写进身份后，文件变成高风险资产。只写环境变量名或引用路径。
+- **与 system prompt 冲突**：如果 system prompt 说叫 A，IDENTITY 说叫 B，模型可能随机选择。加载优先级要明确：身份为基础，任务指令可覆盖执行细节，但身份字段不覆盖。
+- **只增版本不测试**：更新后不验证，可能长期使用坏身份。需要保留上一个 stable 版本。
+- **工具输出混入身份**：禁止将 MCP 工具返回内容直接追加进身份文件，除非经过结构化过滤。
 
 ## 可复用建议
 
-- 身份文件只放**稳定偏好和已验证事实**，临时任务细节放独立日志。
-- 把写入逻辑封装成函数，白名单化 section，不让 agent 任意编辑。
-- 每隔一段时间做一次压缩：合并重复条目，删除过时 workaround，目标控制在 200 行以内。
-- 反复出现的经验应该提炼成脚本、工具或 OpenClaw 插件，而不是无限堆进 IDENTITY.md。
-- 用 Git 审计每次身份变更，能清楚看到 agent 从历史中学到了什么。
+- 把 `IDENTITY.md` 当“合同”而不是“剧本”：写边界，不写具体任务步骤。
+- 每次只改一类内容：角色、工具偏好、记忆路径不要混在一起更新。
+- front matter 便于程序解析，正文保持简短。
+- 如果仓库会公开，先做脱敏，避免泄露个人工作流和目录结构。
+- 配合 MCP 时，身份文件作为只读 resource 暴露，允许查询，不允许写入。
+- 维护身份版本历史，方便对比“改了什么导致行为变化”。
 
 ## 总结
 
-IDENTITY.md 让 OpenClaw 在多次运行之间保持一致性，避免每轮都从零开始。但它不是万能记忆，也不该是无限膨胀的知识库。把它当成一个受控、可版本化、可回滚的身份接口，比让 AI“想记什么就记什么”更可靠。关键在于：结构稳定、写入受限、定期压缩、版本可查。
+`IDENTITY.md` 的价值不是给 AI 一个漂亮人设，而是让它拥有可审计、可回滚、可进化的运行基线。先解决稳定，再谈进化；先限制写入，再允许更新。对 OpenClaw、Agent、MCP、插件和自动化实践者来说，这个文件应该作为基础设施的一部分维护，而不是 prompt 的草稿箱。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/30b648a03171ec62.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/70ef5a42fd64c988.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/c74c146ce4e09ccd.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/bc2db17e90aa45a0.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/d16406263d248ec8.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/ec7c7fd27d0f46ed.png)
 
