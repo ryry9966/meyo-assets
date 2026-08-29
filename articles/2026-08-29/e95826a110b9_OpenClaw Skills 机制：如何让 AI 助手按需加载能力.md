@@ -1,122 +1,107 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 35208
+feedId: 35214
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
 
 ## 背景
 
-在 OpenClaw 这类 Agent 项目里，AI 助手要处理的事情越来越多：文件解析、SQL 查询、浏览器自动化、消息推送……最常见的做法是每增加一个能力，就注册一个常驻工具或插件。结果系统提示和工具定义越来越长，上下文窗口被大量非当前任务所需的描述占满。模型推理变慢、token 成本上升，甚至出现工具选择混乱——明明用户只是想查个 PDF，模型却去调用数据库插件。
+在给 OpenClaw 接 MCP、插件或自动化脚本时，很容易把所有能力说明一次性塞进系统提示。结果常常是：可用能力越多，模型每次对话都要携带所有技能的手册、示例和依赖说明。一个查询任务可能只用到了 5% 的能力，却要为 100% 的能力付费并承担额外延迟。
 
-这暴露了一个核心问题：我们习惯把“能力”做成常驻，而不是按需加载。
+更麻烦的是，如果某个技能依赖本地二进制、Python 包或环境变量，只把说明放进上下文并不等于它能正常工作。模型知道“要调 pdf-extract”，但执行时才暴露依赖缺失、路径错误或脚本不可用。
 
 ## 问题
 
-全部能力常驻会带来几个明显后果：
+全量注入主要有三个工程问题：
 
-- 工具描述互相干扰，模型选错工具的概率上升；
-- 上下文预算被低价值能力占用，影响长对话表现；
-- 插件依赖和权限范围扩大，增加安全风险；
-- 每加一个功能，维护成本不是线性增长，而是叠加在全局复杂度上。
+1. 上下文窗口被大量技能说明占用，挤压真正的业务数据空间。
+2. 无关技能干扰模型注意力，导致任务理解和工具选择变差。
+3. 技能更新后需要重新生成大段提示，维护成本高，且容易出现版本不一致。
 
-因此需要一种 Skills 机制：把能力拆成可发现、可加载、可回收的单元，在需要时才注入完整指令和工具实现。
+Skills 机制的思路是：把每个能力封装成独立技能包。助手默认只加载一个很小的技能索引，匹配到相关任务后再读取完整 `SKILL.md` 和所需脚本。上下文里始终放的是“目录”，而不是“整本书”。
 
 ## 做法 / 步骤
 
-在 OpenClaw 中落地 Skills 机制，可以分成五步。
+### 1. 统一技能目录结构
 
-### 1. 定义 Skill 清单
+每个技能一个文件夹：
 
-每个 skill 至少包含这些字段：
+```
+skills/
+  pdf-extract/
+    SKILL.md
+    scripts/extract.py
+  data-query/
+    SKILL.md
+    scripts/query.py
+```
+
+`SKILL.md` 里写清楚：技能用途、触发词、前置依赖、输入输出、最小示例、失败处理。不要写很长的背景故事，保持工程说明风格。
+
+### 2. 生成精简索引
+
+为每个技能提取一段不超过 5 行的中文描述，包含触发词、依赖、路径。助手启动时只加载索引。按经验，每个技能索引控制在 100–300 token 比较合适。
+
+例如：
 
 ```yaml
-skills:
-  - name: pdf-extract
-    description: Extract text and tables from PDF files
-    triggers: [pdf, extract, parse]
-    entrypoint: skills/pdf_extract.py
-    dependencies: [pypdf]
-    permissions: [read:files]
-    timeout: 60
+- name: pdf-extract
+  triggers: [pdf, 表格提取, text extraction]
+  requires: [poppler]
+  tools: [bash, python]
+  path: skills/pdf-extract
+
+- name: data-query
+  triggers: [查询, 统计, sqlite]
+  requires: [sqlite3]
+  tools: [bash, python]
+  path: skills/data-query
 ```
 
-关键是把“元信息”和“实现体”分开。元信息负责让模型判断是否需要加载，实现体是加载后真正执行的内容。
+### 3. 在系统提示中要求按需加载
 
-### 2. 只注入索引，不注入全文
+可以这样写：
 
-主 prompt 中不要放每个 skill 的完整指令，只放索引：
+> 可用技能见 skills index。当任务匹配某技能时，先读取 skills/<name>/SKILL.md，确认依赖和参数后再执行。执行前必须检查依赖是否存在。
 
-```text
-Available skills:
-- pdf-extract: Extract text and tables from PDF files. Trigger when user mentions PDF or text extraction.
-- sql-query: Run read-only SQL queries. Trigger when user asks about database data.
-```
+关键是要让模型形成“先读完整技能说明，再动手执行”的习惯。
 
-模型看到的是简短索引，不会一上来就被大量工具描述淹没。
+### 4. 用工具或路由强制按需加载
 
-### 3. 命中后加载
+可以在 OpenClaw 里包一个 `get_skill(name)` 工具，返回完整 `SKILL.md`。模型只有调用工具后才获得完整指令，而不是一开始就拥有全部细节。这样能有效避免“似懂非懂”地直接调用脚本。
 
-当用户意图命中 triggers，或者模型根据索引判断需要某个 skill 时，再调用 loader 读取完整指令、注册工具、安装依赖。加载动作最好记录以下信息：
+### 5. 缓存与释放
 
-- skill_id
-- 触发词 / 判断依据
-- 加载耗时
-- token 预估消耗
-- session_id
-
-这为后续优化提供数据。
-
-### 4. 隔离执行
-
-每个 skill 在独立 workspace、namespace 或容器中执行，避免污染全局上下文。比如 `sql-query` 只拿到只读数据库连接，`pdf-extract` 只拿到文件读取权限。skill 之间不共享全局状态。
-
-### 5. 任务完成后卸载
-
-任务结束就卸载 skill，释放 token、内存和临时文件。卸载要彻底，不能只从 prompt 里移除定义，还要清理运行时状态。
+会话中已加载的技能可以缓存，但需要设置上限。比如同一会话最多保留 3 个完整技能；新的加载请求触发旧的技能降级为一行摘要。避免上下文慢慢被历史技能再次填满。
 
 ## 踩坑点
 
-实际落地时，最容易出问题的不是加载逻辑，而是元信息设计。
-
-**触发词太宽泛**  
-比如把 `read` 作为 `file-reader` 的触发词，会导致任何包含“读取/查看/打开”的请求都可能触发加载，最后几乎每次对话都加载一遍。触发词应当具体到动词 + 对象，例如 `pdf`、`extract table`。
-
-**描述太抽象**  
-如果 skill 描述只写“处理文件”，模型无法判断什么时候该用，会出现漏触发或误触发。描述要明确输入、输出和适用边界。
-
-**只加载不回收**  
-有些实现加载很积极，但不做卸载，上下文逐渐膨胀，最后还是回到常驻的老路。加载和卸载必须成对设计。
-
-**依赖冲突**  
-多个 skill 可能需要不同版本的同一个库。全局安装容易冲突，建议每个 skill 使用独立虚拟环境或容器，并锁定版本。
-
-**权限过大**  
-不要为了省事直接给 skill 开放全部权限。默认最小权限，按需临时授权。
-
-**缺乏可观测性**  
-没有加载日志和成本统计，就不知道哪些 skill 命中率低、哪些消耗高，优化无从下手。
+- **触发词过宽**：比如“数据”触发了一大堆技能，反而更慢。建议用组合触发：任务类型 + 数据源 + 动作。
+- **模型不一定真的按需加载**：如果只写“需要时读取”，模型可能跳过去直接编造命令。加载后应要求模型先复述依赖和步骤，确认匹配再执行。
+- **路径不一致**：读取技能时以 skills root 为基准，不要用绝对路径，否则换机器全部失效。
+- **本地依赖未声明**：`pdf-extract` 需要 `poppler`，`data-query` 需要 `sqlite3`。这些必须在 `SKILL.md` 中写明，否则模型加载后仍然不会安装依赖。
+- **索引与 SKILL.md 不同步**：每次改技能后需要重新生成索引，否则索引里的触发词还是旧的，实际技能已经改名。
 
 ## 可复用建议
 
-- 每个 skill 保持单一职责，描述控制在 1～2 句，明确边界。
-- triggers 同时包含正向触发和负面示例，降低误判。
-- 用 loader 记录加载事件，定期统计命中率和 token 成本。
-- skill 之间通过显式接口通信，不要共享全局变量。
-- 依赖隔离、版本锁定，有条件直接容器化。
-- 给每个 skill 设置默认 timeout 和权限白名单。
+- `SKILL.md` 控制在 200–500 行以内，示例只保留最小可运行样例。
+- 用 YAML frontmatter 管理触发词和依赖，便于自动解析。
+- 写一个验证脚本，遍历所有技能目录，检查 `SKILL.md` 是否存在、触发词是否重复、脚本路径是否有效。
+- 用固定任务集做回归测试：统计技能加载命中率、token 消耗、执行成功率。如果命中率低于 80%，说明索引描述需要调整。
+- 技能数量超过 20 个时，考虑把索引再分层：一级索引只放领域，二级索引放技能摘要。
 
 ## 总结
 
-Skills 机制本质上是给 AI 助手做“延迟加载”和“上下文预算管理”。它不是为了增加更多功能，而是让已有能力在正确的时机出现。OpenClaw 场景中，先把元信息、生命周期、隔离和可观测性做好，比堆一堆 skill 更重要。按需加载一旦稳定，token 成本、工具冲突和推理稳定性都会明显改善。
+OpenClaw Skills 机制本质上不是插件越多越好，而是上下文调度：默认放目录，按需取正文，执行后释放。先把索引和触发规则做扎实，再逐步增加技能。这样 AI 助手才能在能力变多的同时，保持响应速度和执行可靠性。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/1709714da9fd3697.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/d71fff1e5ede59a0.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/cb0c44ad868c2798.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/92856975f832c9a6.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/fd4de9716b87dd7f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/87075268d071d714.png)
 
