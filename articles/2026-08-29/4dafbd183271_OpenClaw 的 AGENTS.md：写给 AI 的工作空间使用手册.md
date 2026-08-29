@@ -1,98 +1,88 @@
 ---
 title: OpenClaw 的 AGENTS.md：写给 AI 的工作空间使用手册
-feedId: 35168
+feedId: 35265
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
 
-# OpenClaw 的 AGENTS.md：写给 AI 的工作空间使用手册
+## 背景
 
-在 OpenClaw 里跑自动化、MCP 或多插件任务时，很多翻车不是能力问题，而是上下文漂移：上次会话明确 `pnpm test`，下次它可能执行 `npm test`；你希望产物进 `dist/`，它写到 `scripts/`；一个只读类 MCP 工具被反复调用，甚至触发了写操作。与其每次都靠长 prompt 纠正，不如把工作空间规则固化成 `AGENTS.md`。
+OpenClaw 的 agent 在做自动化任务时，经常不是能力不够，而是上下文不一致。同一个工作区，人知道 `src/` 是主服务、`data/` 不能动、测试要带 `--runInBand`，但 agent 第一次进入时只能靠目录名猜，或者在长会话里慢慢忘记。AGENTS.md 的作用，就是把这些“工作空间使用约定”固化下来，作为 AI 进入工作区后的第一份手册。
 
-## 背景：为什么需要 AGENTS.md
+## 问题
 
-OpenClaw 启动工作空间时，会把根目录的 `AGENTS.md` 作为长期上下文入口。它和普通 README 不同：README 是给人看的项目说明，AGENTS.md 是给 AI 看的操作契约。它要回答的不是“这个项目是什么”，而是“在这个目录里，你能做什么、不能做什么、先做什么”。
+没有 AGENTS.md，或者写得太随意，通常会遇到三类故障：
 
-没有这份文件，OpenClaw 只能依赖模型猜测目录约定和工具边界；有 MCP/插件以后，猜测的成本会被放大。
+1. **启动成本高**：agent 反复探测目录、试错命令，消耗 token，还容易把旧脚本当入口。
+2. **规则漂移**：把关键约束只放在 prompt 里，长任务中途容易丢；尤其多个 agent 或 MCP 工具协作时，各自理解不一样。
+3. **安全边界模糊**：没有写明禁止操作，agent 可能自动 push、删除临时目录、把密钥写进日志。
 
-## 问题：没有 AGENTS.md 的典型症状
+## 做法/步骤
 
-1. 命令选择不稳定：同一仓库一会跑 `yarn`，一会跑 `npm`。
-2. 目录写入混乱：生成文件落在根目录、临时目录或源码目录。
-3. 危险操作无拦截：模型为了完成目标，可能执行删除、强推、覆盖配置等操作。
-4. MCP 权限被滥用：能读的接口被当成能写，能查的库被当成能改。
-5. 每次新会话都要重新交代一遍运行环境、端口和脚本入口。
-
-这些问题用一份短文件就能解决大半。
-
-## 做法：写一份可执行的工作空间使用手册
-
-第一步，把文件放在仓库根目录，并纳入版本控制。OpenClaw 在工作空间加载时会读取它。
-
-第二步，按“机器能直接执行”的格式写，不要写散文。一个最小骨架如下：
+1. **放置与加载**：在项目根或 OpenClaw 工作区根放 `AGENTS.md`。如果启动器支持自动加载，确认路径；不支持就在 system prompt 或项目规则里显式要求 agent 先完整读取。
+2. **内容结构**：按可执行信息组织，不要写愿景。核心模块包括：目录职责、常用命令、环境变量、禁止操作、MCP/插件约定、验证方式。
+3. **维护最小模板**：
 
 ```markdown
 # AGENTS.md
+执行任何任务前，先完整读取本文件，并复述关键约束。
 
-## Project
-One-line goal: ...
+## 目录职责
+- src/：主服务，禁止在 src/ 外新建业务模块
+- scripts/：一次性脚本，不要放生产代码
+- data/：数据目录，只读，禁止修改
 
-## Commands
-- Install: `pnpm install --frozen-lockfile`
-- Test: `pnpm test:unit`
-- Build: `pnpm build`
-- Lint: `pnpm lint`
-- Never run `rm -rf`, `git push --force`, `git reset --hard` without explicit confirmation.
+## 常用命令
+- 安装：pnpm install
+- 测试：pnpm test -- --runInBand
+- 构建：pnpm build
+- 启动：pnpm dev --port 3000
 
-## Layout
-| Path | Purpose | Read/Write |
-|------|---------|------------|
-| `src/` | source code | read-only |
-| `scripts/` | automation scripts | read/write |
-| `dist/` | build output | write only |
-| `tmp/` | scratch files | write only |
+## 环境变量
+- 必填：DATABASE_URL、REDIS_URL
+- 禁止把任何环境变量值写入日志或输出
 
-## MCP / Plugins
-- `filesystem`: read-only. Do not modify tracked files.
-- `github`: create PR only after summarizing diff.
-- `postgres`: SELECT only, use read-only connection.
+## 禁止操作
+- 禁止自动 git push
+- 禁止删除 data/、logs/
+- 禁止运行 rm -rf 或等价命令
+- 修改配置前先备份
 
-## Stop Conditions
-Stop and report when:
-- A command fails twice.
-- The task requires secrets not present in env.
-- The change set exceeds 20 files.
+## 验证
+完成后必须运行：pnpm test -- --runInBand && pnpm typecheck
 ```
 
-第三步，把“禁止项”写清楚。模型对否定句有时会忽略，所以要放在独立段落，并用 `Never`、`Do not` 开头。
+4. **迭代回写**：每次 agent 踩坑后，把人工纠正写回 AGENTS.md，避免下次重复。
 
 ## 踩坑点
 
-- 文件太长：超过 300-500 行后，模型容易只读开头或遗漏中间规则。建议拆成 `AGENTS.md` 加 `docs/agent/` 下的细分文件，主文件只放指针和硬约束。
-- 只写“适当”“可能”“建议”：这些词无法约束行为。改成“必须使用”“禁止执行”“优先选择”。
-- 把 secret 写进 AGENTS.md：即使仓库私有也不要写 token、密码、内网地址。用环境变量引用。
-- 把 AGENTS.md 当 TODO：任务列表会频繁变化，放进契约文件会稀释真正的规则。动态任务应放在会话里或单独 issue。
-- 忘记更新：目录变更、命令改名后不同步 AGENTS.md，AI 会照着旧规则执行。
+- **写成 README**：给人看的背景太多，agent 需要的是路径、命令、禁止项，不是项目愿景。
+- **绝对路径/硬编码**：换容器、换机器就失效，优先用相对路径或环境变量。
+- **安全边界不写**：不要假设 agent 会“自觉”。禁止自动 push、删除、读取敏感文件要明确列出。
+- **文件过长**：超过 200 行后，模型容易忽略尾部；复杂内容拆到 `docs/` 并链接。
+- **只写不更新**：过期规则比没有更危险，agent 会按错误约定执行。
+- **多层级作用域混乱**：明确根 `AGENTS.md` 优先，子目录只放增量规则。
 
 ## 可复用建议
 
-- 用表格描述目录和 MCP 权限，模型对结构化信息的遵循度更高。
-- 每个规则用命令式短句，每条只表达一个约束。
-- 把“停止条件”写进去，避免 AI 在失败后反复重试或扩大操作范围。
-- 定期审计 AGENTS.md：删掉不再使用的命令，合并重复规则，保持它能在 2 分钟内读完。
-- 如果 OpenClaw 支持，可以将 AGENTS.md 与项目级 memory 或 context 配置配合使用，但不要把两者职责混在一起：AGENTS.md 管工作空间边界，memory 管跨会话偏好。
+- 团队统一模板，新项目复制后填空，而不是每次从零起草。
+- 顶部固定一句“先读本文件并复述关键约束”，能显著降低起始漂移。
+- 把验证命令写进去，让 agent 完成后自检，而不是只交代码。
+- 用 git 管理 `AGENTS.md`，变更走 PR，避免个人随口改规则。
+- 配合 MCP filesystem 限制可写目录，并在 `AGENTS.md` 里同步声明。
+- 多 agent 协作时，写清楚各自可写目录和共享只读目录。
 
 ## 总结
 
-AGENTS.md 不是魔法，也不是另一种 README。它是一份简短、明确、可被 AI 稳定读取的工作空间使用手册。写好它，能减少大量重复说明和误操作；写坏它，只会增加上下文噪音。对 OpenClaw 的自动化、MCP 和插件场景来说，越早把规则固化下来，后期越省事。
+AGENTS.md 不是另一份给人看的文档，而是 AI 的工作空间约束。它解决的是上下文一致性和安全边界，不是模型能力问题。好的 AGENTS.md 短、具体、可执行、常更新；差的长篇、模糊、过期。先把根目录那 80 行写好，比堆更多插件更有效。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/2992e284c0fa7b99.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/49f06fa0829be51b.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/60888f5e1b473552.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/be987f939da3c4a1.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/3a25191ee45f2b01.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/107ada9e96641723.png)
 
