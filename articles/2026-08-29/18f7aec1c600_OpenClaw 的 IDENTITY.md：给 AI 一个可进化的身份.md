@@ -1,110 +1,127 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 35179
+feedId: 35235
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
 
-在 OpenClaw 里，Agent 很容易变成一个“每次都像新人”：任务重启后偏好丢失、工具调用风格漂移、协作时互相覆盖边界。把 personality 写在 system prompt 里能解决一部分，但很快就会遇到两个问题：prompt 太长挤压工具定义；身份更新没有版本，越改越乱。
+# OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
 
-IDENTITY.md 的思路是把身份从 prompt 中抽出来，作为一个独立、可维护、可进化的文件。它不只是角色卡，而是 Agent 运行时的最小身份锚点。
+## 背景
 
-## 问题
+在 OpenClaw 的 Agent 实践里，一个很常见的情况是：我们给 Agent 写了一段 system prompt，过两天加一点“不要用 sudo”，再过一周又加“输出先给结论”。这些规则散落在 system prompt、插件配置、记忆文件、甚至某个 MCP server 的描述里。单个 Agent 还能勉强运行，但一旦进入多 Agent 协作、插件调用、长期自动化任务，身份就开始漂移。
 
-一个典型的 OpenClaw agent 会同时做任务规划、调用 MCP 工具、维护本地文件、偶尔需要人确认。如果没有稳定的身份层，常见表现是：
+我遇到过几次典型的故障：重启后 Agent 忘了之前约定好的工作路径；两个 Agent 协同时一个按 root 用户习惯操作，另一个按项目用户习惯操作；插件拿到的是旧的行为偏好，结果生成了不适合当前环境的配置。这些问题不是模型能力不够，而是身份信息没有集中、没有版本、没有边界。
 
-- 每次会话都要重新学习用户偏好；
-- 同一仓库的不同 agent 实例对“能否修改文件”有不同理解；
-- 长期任务跑久了，行为逐渐偏离初始目标；
-- 插件或工具误用后，无法判断是边界不清还是 prompt 冲突。
+IDENTITY.md 的思路很简单：给每个 Agent 一个仓库内可读、可版本化、可审计的身份文件，作为它行为和记忆的单一事实来源。
 
-这些问题单靠增加 system prompt 长度解决不了，反而会挤压可用上下文。身份信息需要分层：核心稳定、操作可调、记忆外置。
+## 要解决什么问题
 
-## 做法
+1. **身份漂移**：system prompt 越改越乱，最后没人说得清这个 Agent 应该是什么。
+2. **长期记忆不延续**：用户偏好、路径约定、错误经验只存在当前会话里。
+3. **插件/MCP 无法取用身份**：工具侧拿不到“你是谁、你的限制是什么”，只能靠 prompt 间接传。
+4. **协作不一致**：多个 Agent 各自为政，缺少共同的边界协议。
 
-我目前的做法如下。
+## 做法与步骤
 
-### 1. 把身份文件独立出来
+### 1. 建立文件
 
-在 agent 工作目录放一个 `IDENTITY.md`，在 OpenClaw 的 bootstrap 或 system preset 中引用它。不要把完整内容直接塞进主 prompt，而是通过文件注入，保持可编辑和可版本化。
+在 Agent 工作区根目录放 `IDENTITY.md`。如果 Agent 通过 MCP 访问文件系统，也可以放到一个独立配置仓库，通过 resource 暴露。
 
-```
-agent/
-  IDENTITY.md
-  memory/
-    evolution.md
-  tools/
-```
+### 2. 内容分块
 
-### 2. 给身份分层
-
-IDENTITY.md 建议固定四个部分：
-
-- **Core**：不可轻易变更的目标、边界、禁止行为。例如“只在 tools/ 下写入文件”“对外部请求先确认再执行”。
-- **Operating**：可调整的工作偏好，如“遇到不确定参数先短暂追问，不要自行虚构”。
-- **Memory Pointer**：指向长期记忆、项目笔记、复盘文件，不把大段内容塞进身份文件。
-- **Evolution**：追加式记录，保存每次复盘结论、规则调整、版本变化。
-
-示例：
+建议固定五个区块，避免什么都往里塞：
 
 ```markdown
-# Core
-- 目标：维护本地自动化工作流。
-- 边界：不得修改 memory/ 下文件。
+# IDENTITY
 
-# Operating
-- 遇到模糊指令，先复述理解再执行。
+## Core Identity
+- 角色：项目运维 Agent
+- 语气：简洁、给命令前先给影响范围
+- 不扮演：客服、销售
 
-# Memory Pointer
-- 长期记忆：memory/long_term.md
-- 最近复盘：memory/evolution.md
+## Operating Principles
+- 优先使用已有脚本
+- 修改前先备份
+- 禁止直接操作生产数据库
 
-# Evolution
-- 2025-01-12：增加“不得覆盖用户未提交的配置”。
+## Working Preferences
+- shell: bash
+- 默认分支: main
+- 时区: Asia/Shanghai
+- 输出路径: /workspace/output
+
+## Evolution Log
+- 2025-01-10: 禁止使用 sudo rm -rf，原因：误删 /tmp
+- 2025-01-12: 增加备份步骤，原因：配置回滚困难
+
+## Non-goals
+- 不做前端页面生成
+- 不处理支付相关数据
 ```
 
-### 3. 加载顺序与优先级
+### 3. 接入运行链路
 
-身份文件的加载位置很关键。通常我会放在工具说明之前、默认系统规则之后。这样既可以覆盖一部分默认行为，又不会提前消耗太多上下文。若 OpenClaw 支持多段 system 注入，可以用“默认规则 → IDENTITY.md → 工具/插件说明”的顺序加载。
+在 OpenClaw 的 pre-prompt 或 system prompt 里注入：
 
-### 4. 让身份进化，而不是频繁改 Core
+```text
+Read IDENTITY.md from workspace root. It is your persistent identity.
+Follow Core Identity and Operating Principles first.
+When a conflict appears, ask before changing behavior.
+```
 
-进化不是每次会话后都改 core。我会在以下触发条件下才更新 Evolution：
+若使用 MCP，可以写一个只读的 `identity-server`，把 `IDENTITY.md` 解析成 `identity://core`、`identity://preferences`、`identity://log` 几个 resource。插件和工具在需要时拉取，不用复制全文。
 
-- 出现一次明确的执行错误；
-- 用户纠正某个行为；
-- 任务完成后做简短复盘。
+### 4. 让身份可进化
 
-更新时只追加记录，不修改 Core。Core 的修改需要单独评审，因为它是稳定边界。
+进化不是每次任务都改。建议提供 `/identity update` 或 `identity.update` 工具，追加 Evolution Log，并要求人工确认或 diff。大概流程：
+
+```
+用户确认 → Agent 生成变更条目 → 更新 Evolution Log → 提交 git
+```
+
+关键点是：身份变更必须有原因、时间、影响范围，不能默默覆盖。
+
+### 5. 版本化
+
+把 `IDENTITY.md` 纳入 git。每次变更至少写清楚 commit message，例如 `identity: add backup before config change`。这样当 Agent 行为突变时，可以先看身份文件改动，而不是翻几页 system prompt。
 
 ## 踩坑点
 
-1. **身份文件过长**。如果 IDENTITY.md 超过约 800-1200 tokens，就会开始挤压工具描述和 MCP 指令。控制身份总量，让核心规则短小明确。
-2. **与系统提示冲突**。OpenClaw 默认规则里可能有“优先执行工具调用”，而你的 IDENTITY 写“遇到不确定先询问”，会造成 agent 表现矛盾。解决方法是明确优先级，并在测试时用冲突样例验证。
-3. **把对话内容直接写进身份**。比如把某次情绪化反馈或一次性偏好变成永久规则，导致身份被污染。长期偏好需要经过筛选，不能自动写入。
-4. **跨项目复用同一份身份**。不同项目的边界和工具不同，直接复用会让 agent 带上上一个项目的模式。建议按项目拆分身份文件，公共部分用模板引用。
-5. **在身份文件中写敏感信息**。IDENTITY.md 可能被工具读取、日志记录或导出，密钥、token、个人隐私都不该出现在里面。
+**文件过长**  
+我见过把几十条少用偏好全部塞进 IDENTITY.md 的做法，结果每次请求 token 暴涨，Agent 反而抓不住重点。控制在 200-400 行以内，核心身份尽量 20 行内。少用的规则放外部 SOP 文件，需要时再读取。
+
+**把秘密写进去**  
+不要在 IDENTITY.md 里写 token、密码、内网拓扑。身份文件可能被日志、调试输出、插件 provider 打印出去。密钥放 secret manager，通过 MCP 按需取用。
+
+**没有变更记录**  
+直接覆盖文件等于没有进化。出了问题时不知道哪次修改导致。Evolution Log 至少要能回答：什么时候、改了什么、为什么。
+
+**身份与权限脱节**  
+文件里写“可以操作生产”，但实际沙箱只给只读权限，Agent 会反复尝试失败。身份文件描述“能做什么”要和实际授给工具链的权限一致，否则会产生错误预期。
+
+**过度进化**  
+让 Agent 每次任务都追加“我应该更谨慎”会导致身份文件膨胀且不稳定。建议限制频率：例如只有在任务失败复盘、用户明确要求、或每周 review 时才允许变更身份。
 
 ## 可复用建议
 
-- 使用 Markdown 分区 + YAML front matter，便于解析和自动化更新。
-- 把 IDENTITY.md 纳入 git 版本控制，让每次“进化”可回溯。
-- 在 agent 的最终输出或自检信息里加上“当前身份版本”，方便快速定位问题。
-- 保持 Core 小、Operating 可调、Evolution 追加，这样身份既有稳定性，又能随项目演进。
+- **先跑最小版**：只写 Core Identity 和 3 条 Operating Principles，跑一周再扩展。
+- **固定标题**：`## Core Identity`、`## Operating Principles`、`## Working Preferences`、`## Evolution Log`、`## Non-goals`，便于脚本解析。
+- **多 Agent 分层**：共享约束放 `SHARED_IDENTITY.md`，每个 Agent 自己的 `IDENTITY.md` 只写差异。
+- **用 MCP 只读暴露**：避免 Agent 直接改源文件；提供 `identity.read` 和 `identity.propose_update`，更新走 PR 或确认流。
+- **审计优于信任**：把 Evolution Log 当成操作记录，不只是一个 memo。
 
 ## 总结
 
-IDENTITY.md 不是另一个更长的 system prompt，而是把“AI 是谁、能做什么、不能做什么”从上下文里抽出来，做成一个可演进、可版本化的工程文件。它解决的不只是人格化问题，更是 OpenClaw 长期运行、多 agent 协作时的行为一致性和可维护性。
-
-如果你的 OpenClaw 实例经常跑偏，不妨先把“身份层”从主 prompt 里剥离，试试用少量、分层、可回溯的 IDENTITY.md 作为锚点。它不会让 AI 变得不可控，反而会让每次变化都有据可查。
+IDENTITY.md 并不是另一种 system prompt，而是 Agent 的长期身份层。它解决的不是“这次回答好不好”，而是“这个 Agent 是不是可预期、可回滚、可协作”。在 OpenClaw 这类 Agent 工程里，身份稳定比单纯聪明更重要。建议从一个小文件开始，把“身份可进化”变成可审计的工程动作，而不是只停留在 prompt 里的一句话。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/c1a90460d878a81c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/77dc0d48bae605ea.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/1404ea1ec3e8ed34.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/1b09483f771a1799.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/14fe51e90dce516f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/1522c2188edd1c2b.png)
 
