@@ -1,6 +1,6 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 35189
+feedId: 35238
 source: 综合讨论
 publishedAt: 2026-08-29
 ---
@@ -9,71 +9,83 @@ publishedAt: 2026-08-29
 
 ## 背景
 
-在 OpenClaw 的 Agent 工作流里，让模型生成 Markdown 内容并不难，难的是把同一份内容发布到公众号、知乎、掘金、Notion、GitHub 等平台时，各家对 Markdown 的支持差异会直接破坏排版。如果让 Agent 在提示词里记住每个平台的规则，不仅 context 膨胀，输出也会不稳定。更可靠的做法是把“生成”和“适配”拆开：固定一份 canonical Markdown，再交给确定性的 adapter 转成平台格式。
+用 Agent 批量产出内容后，发布环节经常变成人工返工。AI 生成的 Markdown 通常包含 frontmatter、HTML 注释、无语言标注的代码块、相对路径图片、行内 HTML，各平台对这些方言支持不同。直接粘贴到公众号、知乎、Notion、飞书或静态站点，结果往往是表格塌掉、代码换行丢失、标题层级被打乱，甚至 frontmatter 直接出现在正文。
 
-## 问题
+问题不在于 Markdown 本身，而在于“AI 默认输出”与“平台期望输入”之间存在差异。解决办法是在中间加一层规范化与适配管线。
 
-AI 生成的 Markdown 通常有几个典型问题：
+## 问题拆解
 
-- 代码块反引号数量不一致，代码内容里出现 ``` 时容易闭合错位。
-- 列表、引用之间的空行和缩进随机，导致不同渲染器结果不一致。
-- 习惯性使用脚注、mermaid 图、任务列表，但很多内容平台并不支持。
-- 标题层级跳跃、表格列过宽、外链图片被盗链。
-- 把平台差异写进提示词，会让模型输出不稳定，也无法复用。
+1. **AI 输出噪声**：模型喜欢生成 Markdown 代码围栏包裹、HTML 注释、多余空行、emoji、非标准表格、未闭合标签。
+2. **Markdown 方言差异**：微信公众号更接近 HTML，表格需要 `table` 而非 pipe table；知乎对代码块和公式支持有限；Notion 对嵌套列表和脚注不友好。
+3. **发布侧限制**：部分平台没有公开的 Markdown 渲染接口，只有块 API 或草稿 API，还会过滤行内样式和脚本。
 
-这些问题的本质不是“模型不够强”，而是格式规则应当由确定性代码处理，而不是由生成模型临场决策。
+## 管线做法
 
-## 做法/步骤
+在 OpenClaw 中拆成四段：解析、清洗、转换、适配发布。
 
-### 1. 定义 single source of truth
+### 1. 解析为 AST
 
-先固定 canonical Markdown 子集：只保留标题、段落、有序/无序列表、引用、代码块、链接、图片、表格、分割线。禁用 HTML 块、脚注、mermaid、任务列表等平台兼容性差的语法。用 markdownlint 配置锁住规则，例如 MD001、MD009、MD031、MD040、MD041，保证每次生成都经过同一套校验。
+用 `unified` + `remark-parse` 把文本解析成 mdast，不要用正则处理。解析后按节点类型做替换和校验，而不是按字符串匹配。
 
-### 2. 生成侧约束
+### 2. 清洗 AI 常见噪声
 
-在 Agent system prompt 里给出 canonical 规范和反例，要求模型只输出该子集。生成后先调用 MCP 工具 `validate_markdown`，校验失败时把 markdownlint 输出作为 feedback 让模型重试。这样模型只负责内容，不负责平台适配。
+写一个 `remark` 插件，遍历 AST 处理：
 
-### 3. AST 适配层
+- 删除 HTML 注释和脚本节点；
+- 标题限制在 64 字符以内，避免平台截断；
+- 代码块补全 `lang`，未知语言降级为 `text`；
+- 图片 `src` 改为绝对 URL，并补 `alt`；
+- 剥离 frontmatter，不把 YAML 丢回正文；
+- 表格统一成 GFM 表格，后续按平台决定保留还是转 HTML。
 
-不要用正则处理 Markdown。用 unified/remark 生态解析成 AST，按平台规则 transform，再用 remark-stringify 统一空行和列表缩进。每个平台一个 adapter：
+### 3. 平台适配器
 
-- **公众号**：Markdown 转行内样式 HTML；代码块转带背景的 `<pre>`；表格根据列宽决定保留或转列表。
-- **知乎**：补齐代码块语言标注；清理外链图片；严格处理列表空行。
-- **掘金**：单独注入 frontmatter；处理摘要分隔与标签。
-- **Notion**：标题从 H2 开始，避免 H1；移除脚注等不支持的语法。
+每个平台写一个 adapter，输入统一 mdast，输出目标格式。
 
-### 4. 接入 OpenClaw
+- **微信公众号**：用 `remark-rehype` 生成 HTML 并注入内联样式；代码块需要 `white-space: pre-wrap` 和 `word-break: break-all`，否则移动端横向溢出；pipe table 必须转 HTML `table`。
+- **知乎**：保留 Markdown，但 `mermaid`、`math` 代码块换成图片或删除；代码语言标注尽量只在常见语言白名单内。
+- **Notion**：走 Markdown import，但把脚注转成行内文本，深层嵌套列表拍平。
+- **静态站点/仓库**：保留完整 Markdown 和 frontmatter，但重写相对链接，并补 `slug` 和摘要。
 
-在插件里暴露三个工具：`validate_markdown`、`transform_for_platform`、`preview_diff`。Agent 生成内容后先 validate，通过后 transform，发布前用 preview_diff 查看转换前后差异。转换产物落盘保存，便于发布后出问题时回滚。
+### 4. 通过 MCP 发布
+
+发布动作挂 MCP server，例如 `create_wechat_draft`、`append_notion_block`。管线输出标准化的 `{ platform, content, meta }`，MCP 只负责调用 API。这样平台 API 变化时，只改 MCP 适配器，不改清洗与转换逻辑。
 
 ## 踩坑点
 
-- **正则解析 Markdown 基本不可靠**：代码块里的 `#`、链接中的括号、嵌套列表都会误判。务必走 AST。
-- **公众号不是标准 Markdown 解析器**：直接粘贴代码块和表格会乱。尤其代码内容中出现连续反引号时，不能简单合并反引号，需要根据内容中最长连续反引号数量选择更长的围栏，或者将内容转成 HTML 实体。
-- **表格在移动端容易溢出**：公众号、Notion 移动端最好转成列表或提前截断列。
-- **AI 经常出现标题跳级**：例如 H2 直接到 H4。canonical 校验应禁止标题层级跳变。
-- **frontmatter 不是所有平台都支持**：关键信息不要只放在 canonical 的 frontmatter 里，adapter 按平台单独添加。
-- **外链图片可能被平台屏蔽**：发布前需要将图片转存到平台素材库或多平台 CDN。
+- 不要用字符串替换做清洗。代码块内的 `#`、表格里的 `|` 很容易被正则误伤，AST 节点处理更稳。
+- 未知语言标注可能让平台丢弃代码块。建议维护语言白名单，未知语言降级到 `text`。
+- 宽表格在公众号、飞书和移动端会溢出。超过 4 列或单元格过长时，自动转成列表或图片。
+- 相对路径图片发布后 404。发布前校验所有 URL，失败则阻断发布或替换占位图。
+- frontmatter 在解析阶段就剥离，避免 YAML 泄漏到正文。
+- 不要直接发送 AI 首轮输出。用 system prompt 把生成限制在受限 Markdown 子集：禁用 HTML 注释、mermaid、行内 HTML，要求绝对图片 URL 和代码块语言标注。
 
 ## 可复用建议
 
-- 把 adapter 写成独立 package，每个平台保存 input/output 样例。
-- 回归测试用 golden files：为每个平台保存期望输出，改动后直接 diff。
-- 发布前跑 pre-commit：markdownlint + 自定义规则，不通过不允许 transform。
-- 保持规则确定性，不让模型参与平台适配。模型只负责内容，格式交给代码。
-- MCP 工具返回结构化结果：`{platform, ok, errors, output, diff}`，方便 Agent 根据错误分支处理。
+把管线配置写成 OpenClaw 插件，核心是“一个中间表示 + 多个 adapter”。建议保持如下结构：
+
+```text
+markdown-pipeline/
+  rules/clean-ai-noise.js
+  adapters/wechat.js
+  adapters/notion.js
+  adapters/zhihu.js
+  index.js
+```
+
+每次发布前执行预检：解析是否成功、图片是否可达、标题长度、代码语言是否在白名单、表格列数是否超标。通过后 dry-run 输出目标格式预览，再调用 MCP 发布。不要依赖 prompt 提醒“适配平台”，而应让内容进入固定工程约束。
 
 ## 总结
 
-Markdown 管线不是一堆正则替换堆叠，而是“单一源规范 + AST 适配层 + 回归测试”。在 OpenClaw 里把生成与格式解耦，可以有效降低 AI 输出的随机性，让多平台发布从反复调格式变成可复现的工程流程。平台差异交给 adapter，内容生成交给模型，两边都不越界，管线才能长期维护。
+Markdown 管线的价值不是一次性转换脚本，而是把解析、清洗、平台适配拆开，并让发布动作通过 MCP 做薄封装。这样 AI 侧可以继续迭代生成质量，发布侧不再反复返工。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/fd88d35288dccb7a.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/9bff088ca0f736bb.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/37df9fdbe24bc3e2.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/669604c14066b627.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/548f681cb3fa014a.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-29/6c6ad57f45b781a8.png)
 
