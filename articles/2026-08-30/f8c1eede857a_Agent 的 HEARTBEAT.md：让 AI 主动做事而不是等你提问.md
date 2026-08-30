@@ -1,117 +1,116 @@
 ---
 title: Agent 的 HEARTBEAT.md：让 AI 主动做事而不是等你提问
-feedId: 35299
+feedId: 35432
 source: 综合讨论
 publishedAt: 2026-08-30
 ---
 
 ## 背景
 
-很多 Agent 实际还是“应答机”：你不发消息，它不动。问题通常不在模型能力，而在于没有给主动行为一个稳定的运行入口。MCP 能接入大量工具，但工具不会自己触发；插件能扩展能力，但缺少固定节奏。于是“请每天帮我检查服务状态”很容易被写进 system prompt，然后在长会话里被稀释、时灵时不灵。
+大多数基于 OpenClaw/MCP 的 Agent 实践，仍然是“请求-响应”模式：你问一句，它答一句；你下一条指令，它执行一次。这种模式适合对话和即时任务，但在很多真实场景里，我们希望 Agent 能主动发现问题、主动同步进度、主动触发下一步动作，而不是等用户坐在电脑前想起该问了才行动。
+
+比如：每天早晨检查代码仓库的未合并 PR、每小时查看一次 CI 状态、发现监控异常时主动发通知……这些需求本质上要求 Agent 具备“心跳”能力：在没有外部提问的情况下，周期性地自我检查并按预设规则行动。
+
+但问题在于：主动行动的意图和边界很难稳定地留在 Agent 的上下文里。每次会话都是新的，靠临时 prompt 拼凑，效果时好时坏，而且不可维护。
 
 ## 问题
 
-把“主动性”交给 system prompt，至少有几个缺陷：
+外部调度器（cron、systemd timer、CI 定时任务）只能解决“什么时候触发 Agent”，但不能解决“Agent 被唤醒后该做什么、不该做什么”。如果每次触发都临时写一段 prompt，要么过于简单，要么散落在脚本里，很快变成不可审计的黑盒。
 
-- 模型只在用户输入后运行，长时间不打开会话就没有执行机会；
-- 没有可观察状态，不知道跑了没有、为什么没跑、跑了什么；
-- 动作边界模糊，容易从“通知我”滑向“自动修复”；
-- 多次执行容易重复、抖动作、污染上下文。
+我们需要一个轻量、可版本管理、可读的“心跳文件”，让 Agent 在每次被唤醒或定时触发时，都能读到同一份稳定的意图和规则。
 
-所以我更倾向于把主动行为拆成一个可读、可审计的心跳文件，而不是一段自然语言指令。
+## 做法/步骤
 
-## 核心做法：HEARTBEAT.md
+### 1. 创建一个 HEARTBEAT.md
 
-`HEARTBEAT.md` 不是一个长 prompt，而是一个运行清单。Agent 每个心跳周期读取一次，按“观察—决策—动作”执行。它应该小、明确、可版本化。
+在 Agent 工作区或项目根目录放置 `HEARTBEAT.md`。它不替代调度器，而是描述“心跳发生时要执行什么”。
 
-目录结构示例：
+### 2. 写清四个核心部分
 
-```text
-~/.openclaw/agents/home-ops/
-├── AGENT.md
-├── HEARTBEAT.md
-├── state/
-│   ├── last_run.json
-│   └── dedupe.json
-└── logs/
-    └── heartbeat.jsonl
-```
+一个可用的 HEARTBEAT.md 至少包含：
 
-`HEARTBEAT.md` 可以写成这样：
+- **触发频率**：多久执行一次，是否允许手动触发。
+- **检查清单**：列出需要主动检查的状态、文件、服务、指标。
+- **行动规则**：满足什么条件时，执行什么动作；动作可以是调用 MCP 工具、写文件、发通知等。
+- **边界与权限**：哪些操作只读，哪些需要审批，哪些禁止执行。
+
+示例（简化版）：
 
 ```markdown
-cadence: 15m
-timezone: Asia/Shanghai
-dry_run: false
+# Heartbeat
 
-## Observe
-- 读 ./inbox/*.md，提取标题和紧急标记
-- 读 ./state/last_run.json
-- 调用 MCP 工具 service_health
-
-## Decide
-- 若 inbox 出现 urgent，且过去 24h 未通知过同一 hash -> Act
-- 若 service_health 连续 3 次非 200 -> Act
-- 否则只记录 heartbeat，不动作
-
-## Act
-allow:
-  - send_dm_to_owner
-  - create_draft_issue
-ask_first:
-  - restart_service
-  - merge_code
-  - delete_files
-
-## Log
-- 每轮追加 logs/heartbeat.jsonl：timestamp, trigger, decision, action_id, result
+trigger: every 30m
+checks:
+  - git status
+  - unmerged PRs
+  - ci last run result
+actions:
+  - if unmerged PRs > 3, post summary to #channel
+  - if ci failed and no comment in 1h, open issue
+limits:
+  - never push code
+  - external calls require approval
+log: .heartbeat.log
 ```
 
-触发入口可以是 cron、systemd timer，或 OpenClaw/Agent 宿主提供的 idle hook。通常只需要一个薄命令：
+### 3. 让 Agent 每次唤醒先读它
 
-```text
-*/15 * * * * openclaw agent heartbeat --agent home-ops --dry-run=false
+在系统提示里加入一条固定指令：**“每次会话开始或 heartbeat 触发时，先读取 HEARTBEAT.md，并严格按其中的规则行动。”**
+
+如果你用的是 OpenClaw 类框架，可以把这条指令放进全局 pre-prompt 或 skill 定义里；如果使用 MCP，可以写一个 `heartbeat` 工具，内部先读文件再执行。
+
+### 4. 配合轻量调度器触发
+
+用系统 cron 或容器内的定时任务调用 Agent CLI 执行一条最小命令，例如：
+
+```bash
+*/30 * * * * openclaw-agent --heartbeat
 ```
 
-## 落地步骤
+此时 HEARTBEAT.md 就是这次运行唯一的上下文来源。调度器只负责唤醒，规则全部交给文件。
 
-1. **先跑只读版**：`dry_run: true`，连续跑 20 轮，只记录 would-do，不执行任何动作。
-2. **检查决策质量**：看是否存在误报、重复、越界动作。
-3. **只放开一个动作**：例如先允许 `send_dm_to_owner`，其他都放 `ask_first`。
-4. **把状态外置**：`last_run.json` 和 `dedupe.json` 不要放进模型上下文，只在需要时读取摘要。
-5. **加锁**：同一时间只允许一个心跳实例运行，可以用 lockfile 或原子写入。
-6. **每轮留痕**：JSONL 记录时间戳、触发条件、决策结果、动作 ID、Agent 版本，便于回滚。
+### 5. 记录心跳日志
+
+在行动规则里要求 Agent 把每次心跳的时间、检查结果、触发动作、执行结果追加到日志文件。这样后续可以审计“它为什么这么做”。
 
 ## 踩坑点
 
-- **心跳噪音**：每 15 分钟跑一次，如果每轮都通知，人会很快忽略。建议“无异常则静默”，只记录日志。
-- **权限滑移**：Act 段不要写自然语言，动作必须来自枚举白名单。`ask_first` 里的东西永远不能自动执行。
-- **上下文膨胀**：不要让 Agent 每轮读完整日志或大文件。只读摘要、计数、哈希和最近时间戳。
-- **重复执行**：用文件哈希、issue ID 或任务 ID 做去重键，不要靠模型判断“这件事我做过没有”。
-- **误报抖动**：服务偶尔超时一次不要立即通知。用连续 N 次失败或持续 T 分钟作为阈值。
-- **注入风险**：如果心跳会读取 `inbox` 或外部文件，里面的内容可能携带恶意指令。Act 阶段必须限制为预定义动作，不能根据文本动态生成 shell 命令或工具调用。
+**指令模糊导致“假主动”**  
+如果只写“主动检查一下项目”，Agent 很可能读完文件后什么都没做，或者只输出一段总结。必须把检查项具体到文件路径、命令、阈值、输出格式。
+
+**上下文膨胀**  
+每次心跳都读入完整 HEARTBEAT.md 没问题，但如果文件里塞了大量背景说明、历史记录，会浪费 token，也干扰判断。心跳文件应保持精简，历史信息放到日志里。
+
+**误触发与循环**  
+Agent 行动后如果修改了某个状态文件，可能在下一次心跳时又满足同一触发条件，形成循环。需要在规则中加入幂等设计，比如“只在最近 1 小时内没有同类动作时执行”。
+
+**权限失控**  
+主动行动比被动响应的风险更高。默认只允许只读操作和发通知；涉及写操作、外部 API 调用、代码提交时，必须设置白名单或人工审批开关。
+
+**频率与成本**  
+每 5 分钟跑一次心跳听起来很“实时”，但会迅速消耗 token 并产生大量噪音。按任务的重要性和时效性，把频率设置在 10 分钟、30 分钟或每天一次，而不是无脑高频。
 
 ## 可复用建议
 
-- 心跳间隔默认 15 分钟；除非是实时队列，否则不要短于 5 分钟。
-- 把 `HEARTBEAT.md` 控制在 100 行以内，太大说明混入了业务逻辑。
-- 观察、决策、动作三段不要混在一起，尤其不要让观察阶段直接触发动作。
-- 每次修改 `HEARTBEAT.md` 都要像改代码一样 review，并且记录版本。
-- 不要用 HEARTBEAT 替代权限系统。主动行为必须仍然服从工具权限、工作区和审计约束。
+- **把它当状态机，而不是一次性脚本**：HEARTBEAT.md 描述的是“每次心跳要检查什么、状态如何转移”，所以要保持规则稳定、易于 diff。
+- **使用结构化字段**：让 Agent 能快速解析 `trigger`、`checks`、`actions`、`limits` 这些段落，避免纯自然语言带来的理解偏差。
+- **保留人工审批开关**：在 actions 里增加 `approval: true` 的标记，让高危动作进入待审批队列，而不是直接执行。
+- **与 MCP 工具解耦**：心跳文件只描述意图，具体命令封装成 MCP 工具或脚本。这样文件本身不包含秘密和复杂命令，方便版本管理和共享。
+- **先 dry-run 再放开**：初期可以加一个 `mode: dry-run`，让 Agent 只输出“如果真实运行会做什么”，确认无误后再改为 `mode: live`。
 
 ## 总结
 
-HEARTBEAT.md 解决的不是“让模型更像人”，而是把主动行为变成一个可观察、可回滚、可关停的轮询任务。它把“主动性”从 prompt 里的模糊期待，变成了一个工程化的小循环：先观察、再决策、最后只做白名单里的动作。
+HEARTBEAT.md 不是银弹，也不会让 Agent 突然拥有真正的自主性。它解决的是一个非常具体的工程问题：**把“主动做事”从临时 prompt 变成一份可维护、可审计、可复用的规则文件。**
 
-在 OpenClaw/Agent/MCP 场景里，这比单纯换一个更长的 system prompt 更稳定，也更容易复现。
+它的成本极低，只需要在 Agent 工作区里放一个 Markdown 文件，配合系统提示和轻量调度器就能跑起来。踩坑点主要集中在规则颗粒度和权限边界上，只要控制好这两点，就能让 Agent 从“等你提问”变成“按节律行动”，同时又不会脱离你的掌控。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/a74761c77088d78d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/8c42a949c0cfcd4e.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/e06c23be58ff5ec9.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/04390520472c345e.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/f1bc16260ccbb464.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/6058c11dc55fae44.png)
 
