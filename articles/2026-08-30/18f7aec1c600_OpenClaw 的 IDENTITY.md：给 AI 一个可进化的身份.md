@@ -1,6 +1,6 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 35341
+feedId: 35345
 source: 综合讨论
 publishedAt: 2026-08-30
 ---
@@ -9,104 +9,85 @@ publishedAt: 2026-08-30
 
 ## 背景
 
-OpenClaw 的自动化场景里，Agent 往往不是只跑一个孤立脚本，而是要同时面对 MCP 服务、插件、定时任务和多层配置。一个常见的问题是：Agent 重启后行为像换了一个“人”。
+很多 OpenClaw 用户在早期会把系统提示词直接塞进任务配置里，任务一结束就丢掉。单任务场景下还能用，一旦进入多 Agent、MCP 工具链、定时自动化任务，问题就会集中爆发：同一个 Agent 在不同任务里行为不一致，刚调好的工具策略换了个入口就失效，权限边界越用越模糊。
 
-同样的工具集，上次会话里它还知道“只读 MCP 可以自动调，写操作必须先确认”，这次上来就直接执行了危险写操作；或者上次踩过的坑，这次又原样踩一遍。原因不是模型变笨了，而是它没有一个跨会话稳定的身份锚点。
+IDENTITY.md 的思路并不新，但真正把它用起来的项目不多。对 OpenClaw 来说，这个文件不是“让 AI 更有人格”，而是给 Agent 提供一个可加载、可审计、可被 Agent 自己更新的身份定义。
 
-IDENTITY.md 的思路很简单：给 Agent 一个持久、可版本化、可演进的运行身份文件。它不是让人写一篇 AI 人设小作文，而是把“角色边界、工具策略、项目约定、历史教训”沉淀成一份可维护的配置。
+## 问题
 
-## 问题表现
+缺少持久身份文件时，常见的坑包括：
 
-在 OpenClaw 的长期使用中，没有 IDENTITY.md 或类似机制时，通常会出现以下问题：
+- 静态 prompt 无法积累经验，每次任务都要重新对齐行为。
+- Agent 对工具权限的理解散落在不同插件配置里，MCP server 一多就乱。
+- 多人协作时，没人知道这个 Agent 已经被改造成什么风格、踩过哪些坑。
+- AI 自动产生的一些有效决策，任务结束后就丢失了，下次继续犯同样的错误。
 
-- 会话间行为漂移：同一个 Agent，今天谨慎、明天激进。
-- MCP 工具滥用或漏用：该用只读工具时用了写工具，或者明明有现成工具却反复手动模拟。
-- 角色越界：Agent 开始修改与当前任务无关的配置，甚至动生产环境。
-- 无法积累项目经验：每次都要把“这个插件在超时会返回空 JSON”重新交代一遍。
+这些问题不是靠把 prompt 写得更长能解决的，而是需要一个结构化的身份文件。
 
-这些问题不是靠把提示词写得更长就能解决，而是需要把稳定约束从临时指令中分离出来。
+## 做法
 
-## 做法与步骤
-
-### 1. 初始化 IDENTITY.md
-
-在项目根目录或 OpenClaw 配置目录创建一个 `IDENTITY.md`，用 YAML frontmatter 标记版本和范围，正文只放跨会话稳定的内容。
-
-最小模板示例：
+在 Agent 工作目录或项目根目录放一个 `IDENTITY.md`，作为该 Agent 的第一加载上下文。建议结构如下：
 
 ```markdown
----
-version: 1
-scope: project
-updated: 2025-06-15
----
+# IDENTITY.md
 
-# Identity
-- 角色：OpenClaw 运维助理
-- 目标：维护自动化流程、排查 MCP/插件故障
-- 边界：不直接修改生产配置
+## Identity Core
+- 角色：OpenClaw 自动化运维代理
+- 默认风格：简洁、可复现、先给结论
+- 运行边界：只操作 /workspace/automation 下的资源
 
-# Tool Policy
-- 只读 MCP 工具可自动调用
-- 写操作、删除、重启服务前必须确认
-- 插件失败时先记录错误，不要反复重试超过 3 次
+## Hard Constraints
+- 不读取或写入 ~/.ssh、~/.aws 下的任何文件
+- 不执行 rm -rf，除非在 sandbox pod 内
+- 网络请求默认走代理出口
 
-# Evolution Log
-- 2025-06-15: weather_mcp 在超时时返回空 JSON，后续需加超时处理
-- 2025-06-18: 定时任务在 Windows 路径下需使用正斜杠
+## MCP / Tool Policy
+- allow: filesystem(read: /workspace/automation)
+- allow: github(create_issue, create_pr)
+- deny: shell(rm, dd, mkfs)
+
+## Evolution Log
+### 2026-01-12 修复 CI 失败
+- 决策：先隔离 flaky test，未直接改业务代码
+- 踩坑：git clean -fd 把本地未提交的 fixture 删了，下次先 stash
+- 偏好：CI 失败优先看最近 3 次 commit，而不是全部历史
 ```
 
-### 2. 注入方式
+加载策略上，建议启动 Agent 时先读取 `Identity Core` 和 `Hard Constraints`，在每次工具调用前用这些内容做一次快速边界判断。MCP 插件初始化时可以直接解析 `MCP / Tool Policy` 段，自动生成白名单和默认拒绝规则。
 
-启动 OpenClaw Agent 时，将 `IDENTITY.md` 的内容注入 system prompt 或会话开头。如果 OpenClaw 支持 MCP resource，也可以把身份文件暴露为只读资源，让 Agent 在需要时主动读取。静态注入的好处是稳定，坏处是占上下文；动态加载的好处是省 token，但要求 Agent 能自觉读取。
-
-### 3. 维护规则
-
-- 每次重大踩坑后，在 Evolution Log 追加一条。
-- 修改身份规则时，version +1。
-- 控制总长度，单文件建议不超过 200 行，超出后拆分。
+进化的关键在于 `Evolution Log`。任务结束时，通过 OpenClaw 的 post-task hook 让 Agent 在完成其他工作后追加一条记录，格式固定为“日期 + 任务名 + 决策/踩坑/偏好调整”。这个动作不需要人工干预，但需要后续 review。
 
 ## 踩坑点
 
-1. **把 IDENTITY.md 写成百科全书**  
-   文件超过 2000 行后，每次会话注入都会显著占用上下文，甚至影响工具调用速度。身份文件不是知识库，只放“影响决策”的约束，不放业务细节。
+1. **凭证写入**：不要在 IDENTITY.md 里放 API key、token 或数据库密码。即使文件在 `.gitignore` 里，Agent 也可能在执行中被诱导输出相关内容。
 
-2. **身份约束与临时指令冲突**  
-   默认约束写得太死，用户临时说“今天破例改生产配置”，Agent 仍然反复确认甚至直接拒绝。建议在文件里明确优先级：用户显式确认 > IDENTITY.md 默认约束 > 工具描述。
+2. **文件膨胀**：Evolution Log 只增不减，很快会把上下文撑爆。建议只加载最近 N 条记录，更早的内容归档到外部 memory 或向量库。
 
-3. **过度拟人化**  
-   “你是一个聪明、热情的 AI”这类描述对行为稳定性没有帮助。可验证的行为规则，比形容词更可靠。
+3. **自动改坏**：AI 偶尔会把 hard constraints 改成更宽松的版本。必须约束 Agent 只能追加 Evolution Log，不能修改 Core 和 Constraints 段。所有自动修改走 diff 人工确认。
 
-4. **敏感信息泄漏**  
-   不要把 API key、内网地址、数据库密码直接写进 IDENTITY.md。身份文件通常会进版本库，应该用环境变量或 secrets manager 引用。
+4. **过度人格化**：写“你是一位天才工程师”没有工程价值，反而会引入不稳定的行为。身份描述要可操作、可验证，尽量用“允许/禁止/默认”这类词。
 
-5. **演进日志无限膨胀**  
-   不要记录每次任务的流水账。演化日志只记录“会影响后续行为的规则变化”，并且定期归档旧条目。
-
-6. **多环境混用**  
-   开发、测试、生产共用一份 IDENTITY.md，容易误操作。可以用 `scope` 字段区分，或者拆成全局通用规则和项目级覆盖。
+5. **多 Agent 共用冲突**：不同 Agent 加载同一份 IDENTITY.md 可能出现行为互相干扰。建议一个 Agent 一份 Identity，公共规范拆到单独的 `POLICY.md`。
 
 ## 可复用建议
 
-- **分层加载**：建议拆成 `identity.core.md`（角色/边界）、`identity.tools.md`（工具策略）、`identity.evolution.md`（演进日志）。核心身份每次必载，工具策略按需载入，演进日志可以动态读取。
-- **纳入版本控制**：IDENTITY.md 应该像代码一样提交、review、合并。Agent 行为变更可以通过 diff 追踪。
-- **定期身份审计**：每隔一段时间检查现有规则是否仍然适用，删除腐化规则。规则越少，Agent 越容易遵守。
-- **与 MCP 工具描述互补**：MCP 描述回答“工具能做什么”，IDENTITY.md 回答“什么时候用、什么时候不用、出了问题怎么处理”。两者不要互相复制。
-- **保持可演进，而非一次性写死**：IDENTITY.md 的价值在于它能随项目一起进化。每次踩坑都是更新身份文件的机会。
+- Identity Core 控制在 8 行以内，Hard Constraints 用 bullet 写清。
+- IDENTITY.md 保持精简，长记忆放外部存储。
+- 每周人工 review 一次 Evolution Log，把稳定有效的决策提炼进 Core 或 Constraints。
+- 将 IDENTITY.md 纳入 git 管理，自动修改必须走 PR review。
+- 如果 OpenClaw 里跑了多个 Agent，先统一 `MCP / Tool Policy` 的格式，否则插件解析会非常痛苦。
 
 ## 总结
 
-IDENTITY.md 不是给 AI 写人设，而是给 OpenClaw Agent 一个可维护的运行约束和记忆锚点。对于挂载了多个 MCP、插件和自动化任务的场景，它能减少重复交代、降低行为漂移，让 Agent 的行为从“每次开盲盒”逐步变成“可预测、可审计、可进化”。
-
-真正好用的 IDENTITY.md，通常不是最长的那个，而是规则少、边界清、能随项目一起迭代的那个。
+IDENTITY.md 不是一份“更漂亮的 prompt”，而是把 AI 当成需要版本管理、审计和边界控制的工程组件。它让 Agent 拥有一个可追溯的身份，也给自动化任务提供了一个可进化的锚点。对于长期运行、多工具、多插件协作的 OpenClaw 项目，这个文件的投入会在第三、第四次重复任务时体现出明显回报。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/b4177e051c433cb4.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/9e381b49d05f6ac6.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/300c9431a9c71960.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/7caa8e189a59e671.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/3c32a949dec86fe0.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/085db218d8d5e0bc.png)
 
