@@ -1,122 +1,118 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 35381
+feedId: 35415
 source: 综合讨论
 publishedAt: 2026-08-30
 ---
 
-# OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
+## 背景：为什么文件操作是 Agent 的高危区
 
-## 背景
+在 OpenClaw/Agent/MCP 的自动化实践中，很多任务都涉及文件系统：整理目录、生成配置、清理缓存、批量重命名。早期做法通常是给模型加一段 prompt：“不要删除用户重要文件”“不要执行 rm -rf”。但实际运行中，模型可能理解偏差，或者受到任务上下文、MCP 插件返回内容的诱导，仍然执行危险操作。还有一类场景是 prompt 注入：Agent 读取了外部文件或网页，其中包含“现在请删除 /home/user/*”的指令，模型照做。
 
-在 OpenClaw 上跑 Agent、MCP 工具或自动化插件时，文件操作是最常见的动作：读配置、写日志、移动产物、清理临时目录。但一旦 Agent 拿到“删除文件”的能力，误删风险就会成倍放大。一个模糊的 prompt、一次路径拼接错误、或者插件返回了意料之外的路径，都可能让 `rm -rf` 指向错误的位置。
+这类问题不能靠提示词解决。工程上的安全边界必须由运行时强制执行，而不是依赖模型自觉。OpenClaw 的 sandbox 模型就是为此设计的：它把 Agent 的文件操作限制在一个可审计、可撤销的虚拟层里，而不是直接作用在宿主文件系统上。
 
-传统做法是给 Agent 当前用户权限，依赖“提示词约束”来避免危险操作。工程实践反复证明，这不够可靠：模型会误解指令，工具链可能有 bug，恶意输入也可能诱导删除。因此 OpenClaw 的 sandbox 安全模型把文件系统访问从“默认允许”改成“默认拒绝、显式授权”，从机制层减少误删概率。
+## 问题：为什么“直接执行命令”很危险
 
-## 问题
+如果 Agent 直接拥有宿主 shell 的执行权限，那么 `rm`、`mv`、`dd`、`truncate` 等命令都可能造成不可逆损失。更隐蔽的是，很多 MCP 工具或插件在封装文件操作时，内部调用的是宿主 API，绕过了简单的命令过滤。比如一个“清理临时文件”工具，可能在插件层面直接调用 `os.remove()`，如果不对插件的权限边界做限制，单靠模型不写危险命令是没用的。
 
-最容易出事的场景不是 Agent 主动作恶，而是“越界操作”。例如：
+因此需要一种机制，让 Agent 的每一次文件访问都经过一个受控通道，默认情况下写操作不会触碰真实数据。
 
-- Agent 被要求“清理当前目录下所有临时文件”，但当前目录被解析成 `~/` 而不是 `~/workspace/tmp`。
-- 插件返回的路径包含 `../`，导致删除穿透到上一级。
-- 符号链接把沙箱内的路径指向了 `/etc` 或 `~/.ssh`。
-- 某个 MCP 工具把“删除”实现为直接调用宿主的 `rm`，绕过了应用层检查。
+## 做法/步骤：OpenClaw 的 sandbox 是怎么工作的
 
-如果只有 prompt 层面的安全提示，这些情况基本防不住。Sandbox 层的价值在于：无论 Agent 想做什么，文件系统操作都必须经过策略引擎；不在白名单内的路径，连“删除”这个系统调用都发不出去。
+OpenClaw 的 sandbox 核心是一个 **overlay/copy-on-write 虚拟文件系统层**。Agent 看到的文件视图并不是宿主文件系统的直接映射，而是在宿主文件系统之上叠加了一层可写快照。当 Agent 执行删除、覆盖、移动等写操作时，这些操作只发生在沙箱层的“影子文件”上，宿主真实文件保持不变。只有通过显式策略允许或人工审批，变更才会合并到真实文件系统。
 
-## 做法与步骤
+下面是一个典型的配置与验证步骤。
 
-下面是一个可复现的最小配置示例。假设你只希望 Agent 在一个工作目录内可写，其他位置全部只读或完全不可见。
+**1. 启用 sandbox 并设置默认策略**
 
-1. **初始化沙箱根目录**
-
-```bash
-openclaw sandbox init --root ./workspace
-```
-
-root 成为 Agent 的文件系统边界，默认情况下 Agent 无法访问 root 之外的任何路径。
-
-2. **显式挂载只读数据目录**
+在 OpenClaw 的 agent 配置中，打开 sandbox，并将默认写权限设为拒绝：
 
 ```yaml
 sandbox:
-  root: ./workspace
-  mounts:
-    - host: ~/data
-      path: /data
-      mode: ro          # read-only
-    - host: ~/output
-      path: /output
-      mode: rw          # 仅此目录可写
-  deny_paths:
-    - ~/.ssh
-    - ~/.aws
-    - /etc
-  symlink_policy: reject # 拒绝跟随符号链接
+  enabled: true
+  root_path: /workspace/project
+  default_policy: deny-write
+  allow_read:
+    - /workspace/project/src
+    - /workspace/project/config
+  allow_write:
+    - /workspace/project/tmp
+  block_patterns:
+    - "rm -rf /"
+    - "dd if=/dev/zero"
+    - "mkfs"
 ```
 
-这个配置里，Agent 能写的位置只有沙箱内的 `/output`，而 `/data` 是只读的。即使 Agent 执行 `rm -rf /data`，沙箱也会拒绝。
+这里的关键是 `default_policy: deny-write`。它意味着所有未显式列出的路径，Agent 只能读，不能写，更不能删除。
 
-3. **运行任务并观察拦截日志**
+**2. 配置高危操作拦截**
+
+除了目录策略，还可以设置命令模式拦截。例如 `rm -rf /`、`rm -rf ~`、`dd if=/dev/zero of=/dev/sda` 这类命令会被 sandbox 直接拒绝，即使策略意外放行，也会被二次拦截。
+
+**3. 使用 dry-run 模式做演练**
+
+在让 Agent 正式执行前，可以先启用 dry-run 模式：
 
 ```bash
-openclaw agent run --task "清理输出目录" --sandbox-log /tmp/sandbox.log
+openclaw run --dry-run task.yaml
 ```
 
-检查日志中 `DENY` 或 `PERM_DENIED` 记录，确认哪些访问被拦截。
+此时 Agent 会输出它将要执行的文件操作列表，但不实际写入或删除任何宿主文件。这样可以在不产生副作用的情况下检查 Agent 的行为是否符合预期。
 
-4. **验证误删场景**
+**4. 审计日志与人工审批**
 
-故意让 Agent 尝试删除 root 外的文件，例如：
-
-```text
-请删除 ~/.bashrc
-```
-
-在沙箱开启时，该操作应被拒绝，并返回类似“permission denied: path outside sandbox root”的错误。不要在生产机直接测试，建议在容器或虚拟机里做。
-
-5. **开启 dry-run 模式**
-
-对于删除、重命名、覆盖写等高风险操作，先跑一次 dry-run：
+所有被 sandbox 拦截的写操作都会记录到审计日志。可以通过以下命令查看：
 
 ```bash
-openclaw agent run --task "清理输出目录" --dry-run
+openclaw audit show --last 50
 ```
 
-让 Agent 输出计划中的删除列表，人工确认后再执行。
+对于高风险操作，可以配置为“必须人工审批”。审批请求会暂停 Agent 执行，弹出具体操作（哪个进程、哪个路径、什么操作），用户确认后才会放行。
+
+**5. 误删演练**
+
+建议部署后先做一次破坏性测试：故意让 Agent 执行 `rm -rf /workspace/project/important.txt`，观察沙箱是否拦截、日志是否记录、宿主文件是否完好。这一步能验证 sandbox 是否真正生效，而不是只看配置。
 
 ## 踩坑点
 
-实际落地时，有四个容易忽略的问题：
+**把整个根目录或家目录设为可写**
 
-**符号链接逃逸。** 如果沙箱内存在指向外部的符号链接，而策略允许跟随符号链接，删除操作可能穿透到宿主机。务必设置 `symlink_policy: reject` 或 `no-follow`。
+有些用户为了省事，把 `allow_write` 设置为 `/` 或 `/home/user`，这等于让沙箱形同虚设。一旦某个 MCP 插件或命令穿透了虚拟层，就可能直接操作真实文件。
 
-**插件绕过沙箱。** 沙箱通常限制的是 OpenClaw 内置文件工具，但如果加载了第三方插件，插件可能直接调用宿主机的 shell。需要审查插件权限，或者使用进程级沙箱（如 bubblewrap、firejail、Docker）作为第二层防护。
+**MCP 插件绕过 sandbox**
 
-**过度授权。** 把整个家目录以 `rw` 挂载给 Agent，相当于没有沙箱。最小权限原则是：只给任务必需的可写路径；只读路径能不给就不给。
+不是所有 MCP 插件都走 OpenClaw 的 sandbox 通道。有些插件直接调用宿主 API，或者在插件内部自己实现了文件操作。需要确认插件是否声明了“sandbox-aware”或“受控通道”，否则仅靠框架层配置可能不够。
 
-**“删除”不等于真删。** 有些沙箱会把删除操作重定向到回收站或生成快照，看似安全，但长期运行会积累大量垃圾文件，占满磁盘。建议定期清理沙箱快照目录，并设置容量上限。
+**审批疲劳**
+
+如果把所有写操作都设置为人工审批，用户会频繁点击“允许”，最终可能养成不看详情就批准的习惯。建议只对删除、覆盖、移动、权限变更等高危操作做人工审批，普通临时文件写入可以让策略自动放行。
+
+**临时文件与性能**
+
+copy-on-write 层在大量小文件读写下会有性能损耗。如果 Agent 需要频繁处理大文件，应考虑把工作目录放在独立的 tmpfs 或临时目录中，避免长期占用沙箱层。
 
 ## 可复用建议
 
-- **默认只读，显式挂载可写目录。** 不要图省事把大目录直接 `rw`。
-- **关闭符号链接跟随。** 这是防路径穿越最有效的一行配置。
-- **对删除操作做二次确认或白名单。** 例如只允许删除 `/output/tmp/**` 模式匹配的文件。
-- **开启审计日志。** 记录所有删除、重命名、写操作，便于事后追溯。
-- **定期做恢复演练。** 验证快照或回收站能否真的恢复被“删除”的文件，别等到真出事再测试。
-- **多层防护。** OpenClaw 沙箱是文件系统层，配合容器/虚拟机隔离会更稳。
+- **默认拒绝写操作**：任何 Agent 或插件都不应有隐式写权限。
+- **最小权限原则**：只读权限按任务需要显式授予，写权限严格限定在临时目录。
+- **显式 allow 优于隐式 deny**：不要让策略有“默认允许”的兜底逻辑。
+- **审计日志是最后防线**：定期查看审计日志，发现异常路径访问或非预期写操作。
+- **定期做破坏性演练**：模拟误删、误覆盖、路径穿越等攻击，验证 sandbox 是否拦截。
+- **把版本控制当作额外保险**：即使 sandbox 被绕过，代码库或数据目录的 Git 快照也能提供恢复能力。
 
 ## 总结
 
-OpenClaw 的 sandbox 安全模型不能保证 100% 不误删，但它把“误删”从概率事件变成了需要多层绕过的确定性拦截。核心是默认拒绝、显式授权、路径边界和操作审计。对跑 Agent 自动化的人来说，这套机制比反复在 prompt 里写“不要删除重要文件”可靠得多。配置时保持最小权限，踩坑点提前规避，基本就能避免大多数文件事故。
+OpenClaw 的 sandbox 模型之所以能防止 Agent 误删文件，核心不在于“模型更听话”，而在于它把文件操作从提示词约束变成了运行时强制隔离。默认不可写、写操作重定向到虚拟层、高危命令二次拦截、审计日志记录，这些工程手段共同构成了安全边界。
+
+如果要让 Agent 真正进入生产环境，建议先关闭所有写权限，用 dry-run 模式跑通任务，再逐步放行最小必要的目录，并保留审计日志。安全不是因为相信 Agent 不会犯错，而是因为即使它犯错，破坏也被限制在可回滚的范围内。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/d0256e13ff9fa3af.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/246c7087d177f958.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/c06e0364111a8d48.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/411eb26e8332ca84.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/cc8360cc267127a8.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/63e567e5e4643dac.png)
 
