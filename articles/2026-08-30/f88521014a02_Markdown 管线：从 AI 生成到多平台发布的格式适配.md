@@ -1,90 +1,102 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 35339
+feedId: 35388
 source: 综合讨论
 publishedAt: 2026-08-30
 ---
 
 ## 背景
 
-在 OpenClaw 社区的 Agent 自动化实践里，我们经常让 LLM 生成 Markdown 内容，再通过 MCP 工具或插件分发到博客、GitHub、公众号、Notion 等多个平台。Markdown 作为中间格式非常轻量，但不同平台对 Markdown 的解析和渲染并不一致。直接发布往往出现标题错乱、表格破裂、图片失效、代码块格式丢失等问题。要稳定地自动化发布，需要一条 Markdown 管线来做格式适配。
+Agent 输出 Markdown 往往只是半成品。常见链路是让模型写文章、周报或发布稿，然后直接发到公众号、Notion、知乎或 WordPress。看起来是“标准 Markdown”，发布后却出现代码块样式丢失、表格被压缩、图片 403、脚注残留、标题层级混乱。
 
-## 问题
+根因不是模型写得差，而是 Markdown 方言太多，AI 生成又不够稳定。多平台发布必须把“AI 原文”先收敛成结构化中间态，再做平台适配。
 
-不同平台对 Markdown 的兼容差异集中在几个方面：
+## 问题拆解
 
-- **标题层级**：有的平台把第一个 H1 当作文章标题，正文里再出现 H1 会重复显示；有的平台要求正文从 H2 开始，H1 留给系统标题。
-- **代码块**：围栏标记、语言标识、内部反引号转义各有不同；部分编辑器要求先转成 HTML 再导入。
-- **表格**：对齐语法（`:---`）、单元格内换行、竖线转义支持不一，复杂表格容易破裂。
-- **图片**：相对路径、外链防盗链、尺寸语法（如 `![](url =300x)`）的支持度不同。
-- **扩展语法**：脚注、数学公式、Callout、任务列表、删除线等在很多平台不受支持。
+1. **方言差异**：GFM 表格、任务列表、脚注、公式、mermaid 在各平台支持不同。
+2. **生成不稳定**：全文被 ```markdown``` 包裹、frontmatter 污染、标题越级、空段落。
+3. **资源不可用**：本地路径、防盗链、webp/svg 限制。
+4. **元数据混入正文**：模型开场白“以下是正文”等进入发布内容。
 
-## 做法/步骤
+## 做法：三段式管线
 
-1. **约束源格式**  
-   在 prompt 或输出 schema 中限定 Markdown 子集。建议只保留基础语法 + GFM 表格 + 围栏代码 + 图片 + 链接，避免在生成阶段使用脚注、Callout、数学公式。这比事后转换更可靠。
+### 1. 规范化：收敛为 canonical markdown
 
-2. **建立平台 profile**  
-   为每个目标平台维护一份 JSON/YAML 配置，记录标题偏移、是否支持 GFM、图片处理规则、需要剥离的语法等。例如：
+建议以 CommonMark + GFM 表格/任务列表/围栏代码块/链接图片为中间态，前置 frontmatter 存标题、标签、摘要、封面。
 
-   ```yaml
-   platform: wechat
-   heading_offset: 1
-   gfm: false
-   image_size_syntax: false
-   strip:
-     - footnote
-     - callout
-     - math
-   ```
+```yaml
+---
+title: 周报
+tags: [release, agent]
+summary: 本周发布摘要
+cover: https://cdn.example.com/cover.png
+---
+```
 
-3. **使用 AST 转换**  
-   不要用正则解析 Markdown。使用 unified/remark 或 markdown-it 等解析器，遍历 AST 节点进行转换。正则处理嵌套结构非常容易出错。
+规范化步骤：
 
-4. **图片处理**  
-   统一在源文件中使用绝对 URL 或图床标识。适配器负责上传本地图片到图床并替换链接，同时剥离不支持的尺寸语法。
+- 用 AST 解析，不要正则替换。
+- 整篇外层如果是 ```markdown ...```，先剥离代码围栏。
+- 标题从 H2 开始重排，避免和页面标题重复。
+- 删除 frontmatter、空段落、模型开场白/结束语。
+- 本地图片上传对象存储，替换为 CDN 绝对 URL；链接统一规范。
 
-5. **标题和元数据**  
-   从 front matter 提取标题、标签、摘要，按照平台要求调整标题层级（通常是整体降一级），并在需要时删除重复的 H1。
+### 2. 适配器：canonical AST -> 目标格式
 
-6. **代码块和表格**  
-   代码块根据平台能力去掉语言标识或转义内部反引号；表格中竖线需要转义，避免单元格内出现复杂内容。
+每个平台独立 adapter，不要共用一套 HTML。
 
-7. **扩展语法降级**  
-   脚注转为括号注释；Callout 转为引用块加 emoji 前缀；任务列表转为普通列表；数学公式可转为图片或纯文本，视平台而定。
+- **公众号**：用 markdown-it 渲染 HTML 并内联样式；代码块转 `pre` 浅灰背景；表格单元格超限合并；图片转 JPEG/PNG，不用 webp。
+- **Notion**：节点映射到 paragraph/heading/code/table/quote 等 block，图片先上传再挂 block。
+- **知乎/掘金**：保留 GFM，公式和脚注降级为图片或括号文本。
+- **WordPress**：HTML 或 Gutenberg blocks；外链图片下载入媒体库。
 
-8. **自动化流程**  
-   将适配器封装为 MCP 工具或 CLI。Agent 生成内容后，调用适配器生成各平台版本，再调用发布接口或导出文件。
+示例配置：
+
+```yaml
+pipeline:
+  normalize:
+    strip_outer_fence: true
+    heading_start: 2
+  adapters:
+    wechat:
+      image_format: jpeg
+      inline_style: true
+    notion:
+      max_table_cell_chars: 2000
+```
+
+### 3. 校验与回滚
+
+发布前 dry-run 并校验：空标题、断裂链接、本地路径、图片可访问性、表格超限、正文长度。失败进入人工或重试，不直接覆盖线上。
 
 ## 踩坑点
 
-- 使用正则处理嵌套 Markdown 结构极易出错，务必用 AST。
-- 代码块内 `${}`、HTML 实体可能被平台二次转义，注意转义顺序。
-- 图片相对路径会 404，必须统一为绝对 URL。
-- 表格单元格内出现未转义的竖线会破坏表格。
-- 标题前后空行不足可能导致平台不渲染标题。
-- 多平台分发时，避免直接修改同一个文档对象，应基于源文档生成副本。
-- 某些平台“导入 Markdown”实际上是导入 HTML，需要先转换再粘贴。
+- 不要用正则处理嵌套 Markdown，如引用里的列表、代码块里的表格。
+- 公众号代码块必须内联样式，外部 CSS 会被过滤。
+- Notion 表格单元格有 2000 字符限制，长文单元格需拆分。
+- 外链图片直接发公众号常见 403，需下载上传到自己的 CDN。
+- 模型输出的 HTML 注释、零宽空格、`<br>` 要清理。
+- 多平台发布时，源文档只保留 canonical markdown，不要把平台 HTML 当源文件改。
 
 ## 可复用建议
 
-- 维护一张平台能力矩阵表，标注各平台对 Markdown 语法的支持情况，作为 profile 设计依据。
-- 优先在生成阶段约束 LLM 输出，而不是全部依赖转换器修补。
-- 使用 markdownlint 自定义规则，提前拦截不支持的语法。
-- 图床侧统一处理图片格式和防盗链，适配器只负责 URL 替换。
-- 每次发布前在测试账号做一次冒烟测试，验证格式渲染。
+- 拆成 MCP 工具：`md_normalize`、`md_adapt_wechat`、`md_adapt_notion`、`md_validate`，由 agent 按平台调用。
+- 统一输出 `{meta, markdown, assets}`，不要只返回裸字符串。
+- 准备典型 fixture 库，包含表格、代码块、嵌套引用、多图。
+- 加 diff 检查，多平台正文差异应只来自适配，不应改变语义。
+- 记录规范化前后 AST 差异，便于排查模型输出变化。
 
 ## 总结
 
-Markdown 管线是连接 AI 生成与多平台发布的中间层。通过“约束源格式 + AST 转换 + 平台 profile”的组合，可以显著减少格式错乱，让自动化发布更可靠。工程上不要追求全语法兼容，而是为每个平台做最小必要适配。把复杂语法留在源端之外，用降级策略处理，能让整条管线更稳定、更易维护。
+AI 生成 Markdown 到多平台发布，核心不是“写更好提示词”，而是建立从不可信文本到结构化中间态的管线：先规范化，再 AST 适配，最后校验回滚。不要让平台特性倒灌回源文档。OpenClaw 的自动化场景里，这套管线可以沉淀为插件或 MCP 工具，降低发布事故和人工返工。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/eafd45535776b7ce.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/a11055024b2092c6.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/75ed088cf457919c.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/714d415dca8eea7b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/09ec87b31109dd96.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-30/1bc1c92e15ad361d.png)
 
