@@ -1,81 +1,98 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 35552
+feedId: 35568
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
-## 背景：工具越多，Agent 不一定越强
+## 背景
 
-在 OpenClaw 里，常见做法是接入 MCP、插件，或直接把一堆 function schema 塞进系统提示。工具少的时候没问题，但当项目同时有数据库查询、日志分析、文件处理、发布、监控、通知等能力时，上下文会被大量 JSON Schema 和工具说明占满。更麻烦的是模型开始“乱选工具”：明明只是查日志，却先调用发布接口；或者因为描述太像，反复尝试错误工具。
+OpenClaw 作为 Agent 运行时，通常会接入 MCP 工具、内部 API、脚本、知识库等。随着能力增多，如果所有工具和提示词都常驻上下文，会出现几个典型问题：上下文窗口被占满、工具选择噪声增加、不同能力之间的指令互相干扰、维护成本直线上升。Skills 机制的目标是把一组相关能力封装成可独立维护的单元，只有匹配到用户意图时才注入对应提示词和工具。
 
-Skills 机制解决的不是“能不能调工具”，而是“什么时候加载哪段能力”。它把一组提示词、脚本、资源文件和权限声明打成一个可按需激活的包，平时只保留轻量索引，命中后再加载完整内容。
+## 问题
 
-## 问题：常驻工具与按需技能的区别
+全量加载不是工程方案。比如一个同时接文件处理、浏览器自动化、数据分析的 Agent，如果每次对话都注入所有工具描述、参数 schema、示例和约束，token 消耗会非常可观，同时模型选错工具的概率也会上升。更麻烦的是，不同 skill 的指令可能互相冲突：一个要求“只输出 JSON”，另一个要求“自然语言回复”；一个要求“禁止删除文件”，另一个却需要批量重命名。另外，安全边界不清晰，所有 skill 脚本都暴露给模型，风险较高。
 
-常驻 MCP/插件的问题主要有三个：
+## 做法/步骤
 
-1. 上下文膨胀：每个工具都有名称、描述、参数 schema，几十个工具会持续占用 token。
-2. 选择干扰：工具描述有一定重叠时，模型容易选错，尤其在长对话中。
-3. 资源与权限过度暴露：很多工具本次任务根本不需要，但常驻意味着它们一直可用。
+### 1. 设计 skill 目录结构
 
-Skills 更像“能力目录 + 懒加载”。调度器只读取技能的 manifest：名称、用途、触发词、依赖、入口文件。只有匹配到任务时，才把该技能的完整提示、脚本说明、资源加载进当前会话。
+每个 skill 一个目录，包含 `SKILL.md`（元数据与触发说明）、`scripts/`（可执行脚本）、`references/`（参考资料）、`assets/`（静态资源）。例如：
 
-## 做法：一个最小可用的 Skills 目录
-
-我建议把技能放在项目内 `skills/` 下，每个技能一个目录，核心文件用 `SKILL.md` 或 `skill.yaml`。例如：
-
-```yaml
-name: log_analyzer
-description: 分析应用日志中的错误堆栈，适合用户说“看下报错”“日志有什么异常”
-triggers: [报错, 异常, error, stack trace]
-entrypoint: scripts/analyze.py
-permissions: [read:logs]
-timeout: 30s
+```
+skills/
+  file-ops/
+    SKILL.md
+    scripts/convert.py
+    references/mime-types.md
+  browser-automation/
+    SKILL.md
+    scripts/playwright_runner.js
 ```
 
-关键不是文件格式，而是把“触发信息”和“执行体”分离。调度流程可以这么做：
+### 2. 用 frontmatter 声明契约
 
-1. 启动 OpenClaw 时扫描所有技能，只加载 `name/description/triggers` 形成索引。
-2. 用户输入进来后，先用关键词、规则或 embedding 做粗排。
-3. 命中候选技能后，再读取完整技能内容，注入当前会话。
-4. 技能执行完或任务结束后，从会话中移除详细内容，只保留结果。
-5. 如果一个技能需要调用 MCP 工具，在技能内声明依赖，而不是提前常驻。
+`SKILL.md` 的 frontmatter 是 skill 的核心接口。示例：
 
-这样 MCP 负责稳定的外部系统连接，Skills 负责“怎么把事做对”的流程和判断。两者不是替代关系，而是分层。
+```yaml
+---
+name: file-ops
+description: 处理常见文件转换、重命名、压缩
+when_to_use: 用户要求转换文件格式、批量重命名、压缩目录
+allowed_tools: ["fs.read", "fs.write", "shell.run"]
+inputs: ["source_path", "target_format"]
+outputs: ["result_path"]
+---
+```
+
+### 3. 在 OpenClaw 配置中注册
+
+在 `openclaw.yaml` 中声明 skills 路径和触发策略：
+
+```yaml
+skills:
+  path: ./skills
+  default_mode: auto   # manual | auto | disabled
+  max_loaded: 3
+  cache_ttl: 300
+```
+
+### 4. 运行时按需加载
+
+OpenClaw 先让模型判断用户意图，再从 skill 索引中匹配候选。匹配到后，把对应 `SKILL.md` 的指令和 `allowed_tools` 注入当前会话，执行结束后卸载或缓存一段时间。多个 skill 可以链式触发，但需要在 `SKILL.md` 中显式声明 `dependencies`。
+
+### 5. 建立可观测性
+
+记录每次触发了哪些 skill、触发理由、耗时、是否成功、错误信息。这些数据是后续调优触发条件的基础。
 
 ## 踩坑点
 
-**description 写太宽**：写“处理数据”这种万能描述，会让每个任务都误触发。应该写清适用场景和反例，例如“适用于日志文件，不适用于数据库慢查询”。
-
-**路径问题**：技能内脚本经常用相对路径，但加载后工作目录可能不是技能目录。建议统一使用 `cwd: skill_dir` 或在入口处规范路径解析。
-
-**加载不卸载**：实现时容易只加载不移除，聊几轮后又变成全量上下文。最好给技能设置会话内生命周期，比如“本轮任务有效”或“用户切换主题后失效”。
-
-**依赖未声明**：技能运行时才发现缺环境变量、缺 Python 包或缺少某个 MCP 连接。manifest 里应显式声明 `env`、`packages`、`mcp_servers`。
-
-**索引与内容不同步**：改了 SKILL.md，但索引缓存没刷新，导致模型拿到旧触发词。建议在 CI 或启动时校验 manifest 并重建索引。
+- **触发条件过宽或过窄**：过宽会导致 skill 频繁误加载，过窄则永远不触发。建议先用小样本测试，统计触发准确率。
+- **SKILL.md 内容冗长**：把详细步骤放到 `references/` 中，`SKILL.md` 只写核心约束和接口，按需让模型再读取参考资料。
+- **脚本路径硬编码**：使用相对 skill 目录的路径，由 OpenClaw 注入 `base_dir` 环境变量，避免跨平台问题。
+- **权限未隔离**：skill 脚本默认不应有完整系统权限，最好通过白名单工具调用，或者在沙箱中执行。
+- **状态残留**：某些 skill 会写临时文件或环境变量，执行完要清理，避免影响后续对话。
+- **缓存问题**：skill 更新后，旧会话可能还缓存旧版本，需要版本号或失效机制。
 
 ## 可复用建议
 
-- 技能要保持小：一个技能做一件事，长流程拆成子技能，由主技能编排。
-- 触发信息要有正例和反例，不只靠关键词，最好加上“不要使用本技能”的边界描述。
-- 每次加载技能时限制预算：最大 token、最大工具调用次数、超时时间。
-- 让技能可重入：脚本不要依赖上一次执行的全局状态，避免会话污染。
-- 给技能加版本号和作者信息，多人协作时避免覆盖。
-- 对调度结果做日志记录，方便后面分析“为什么这次没有触发”。
+- 把 skill 当成 API 设计：有清晰的输入、输出、错误码和边界条件。
+- 先用 `describe` 阶段让模型输出意图，再用匹配器选择 skill，而不是直接让模型自由调用。
+- 为每个 skill 写一个最小测试用例，验证手动触发能跑通，再开启自动触发。
+- 准备一个 skill 脚手架模板，减少重复配置。
+- 控制单次加载的 skill 数量，避免并发冲突和上下文膨胀。
 
 ## 总结
 
-OpenClaw Skills 的核心不是增加更多工具，而是把能力组织成可检索、可加载、可释放的单元。它和 MCP/插件互补：插件提供连接，Skills 提供判断和流程。实现时先做好轻量索引和生命周期管理，再逐步加入 embedding、权限控制和自动编排。这样上下文更干净，模型选择更稳定，也能在复杂项目里持续扩展。
+OpenClaw Skills 机制解决的是 Agent 能力扩展中的上下文和治理问题：不是让模型记住所有能力，而是在需要时精准加载。通过清晰的 skill 契约、按需注入和可观测性，可以显著降低长期维护成本。建议从一两个高频 skill 开始，验证触发准确率后再逐步扩大范围。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/1263ef8d056adaec.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/c83445e31a980ae5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/5276b9f4d946e351.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/06b622c48803a9a9.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/9388451d96ae8338.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/2bd3dc49f888fc3b.png)
 
