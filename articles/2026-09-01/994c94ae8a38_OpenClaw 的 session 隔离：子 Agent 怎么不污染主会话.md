@@ -1,123 +1,92 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 35591
+feedId: 35617
 source: 综合讨论
 publishedAt: 2026-09-01
 ---
 
-# OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-
 ## 背景
 
-在 OpenClaw 里做多 Agent 编排时，一个很常见的模式是：主 Agent 收到任务后，拆解并派发给若干子 Agent 执行，然后汇总结果。这个模式本身不复杂，但如果不做 session 隔离，子 Agent 的上下文会直接回灌进主会话——对话历史膨胀、系统提示词被稀释、中间推理过程混入最终决策流，导致主 Agent 后续行为跑偏。
+在 OpenClaw 里把自动化任务拆给子 Agent 之后，最常遇到的不是子 Agent 能力不够，而是主会话被慢慢污染。子 Agent 的中间推理、工具调用返回、重试日志、插件输出会一起混进主上下文。主模型每轮都要重读这些内容，跑几步之后就开始注意力漂移。
 
-这不是 bug，是架构上欠了一笔债。
+## 问题
 
-## 问题：污染具体指什么
+主 session 承担两件事：决策和短期记忆。子 Agent 如果直接继承父 session，等于把执行过程也写进了主上下文。表现通常是：
 
-子 Agent 污染主会话通常表现为三种形态：
+- token 消耗快速上升；
+- 后续指令被某个无关报错带偏；
+- 重跑同一任务时，主会话状态不确定，难以复现；
+- MCP 工具状态被串用，子任务之间互相影响。
 
-1. **上下文膨胀**：子 Agent 的完整推理链、工具调用日志、错误重试记录全部写回主会话历史，几轮下来 token 消耗翻倍。
-2. **状态串味**：子 Agent 内部的临时变量、中间结论、甚至未完成的 thought 片段残留在主会话中，主 Agent 后续推理时把这些噪声当成有效上下文。
-3. **指令漂移**：子 Agent 带着自己的一套 system prompt 或行为约束进场，执行完后这些约束没有被剥离，反而渗透进主会话的语义空间。
+本质不是“信息太多”，而是信息粒度错了。主会话需要的是结论，不是完整 trace。
 
-核心矛盾在于：**子 Agent 需要足够的上下文才能干活，但主 Agent 只需要它的结论，不需要它的过程。**
+## 做法 / 步骤
 
-## 做法：四步隔离
+1. **显式创建独立 session**  
+   子 Agent 不要省略 `session_id`。让它使用独立 session，只把结果传回主会话。
 
-### 1. 独立 session 创建子 Agent
+2. **定义回传协议**  
+   子 Agent 只返回结构化结果，例如：
 
-给每个子 Agent 分配独立的 session ID，禁止复用主会话的 session：
+   ```json
+   {
+     "outcome": "completed",
+     "evidence": "已生成 3 个候选方案",
+     "risks": "第 2 个方案需要人工确认参数"
+   }
+   ```
 
-```python
-sub_session = openclaw.create_session(
-    parent_session_id=main_session.id,
-    scope="subagent",
-    ttl=600  # 子会话独立过期
-)
-sub_agent = SubAgent(
-    session=sub_session,
-    system_prompt=SUB_TASK_PROMPT,  # 子 Agent 自己的提示词，不继承主提示词
-)
-```
+   不返回逐轮日志、不返回完整工具输出。
 
-关键点：`parent_session_id` 只用于追踪血缘关系，不用于共享上下文。
+3. **主会话用工具调用方式读取结果**  
+   主 session 读取子 Agent 的返回摘要，不订阅子 session 的事件流。
 
-### 2. 显式裁剪输入上下文
+4. **设置截断与落盘**  
+   类似这样的配置思路，按当前版本调整字段：
 
-不要直接把主会话的完整历史传给子 Agent。只抽取与子任务相关的必要信息：
+   ```yaml
+   sub_agent:
+     isolated_session: true
+     reply_mode: structured_summary
+     max_reply_tokens: 1200
+     drop_intermediate: true
+     trace_sink: file:///tmp/oa-trace/{trace_id}.jsonl
+   ```
 
-```python
-sub_input = extract_relevant_context(
-    main_session,
-    keys=["user_requirement", "target_file", "constraints"],
-    max_tokens=2000
-)
-result = await sub_agent.run(sub_input)
-```
-
-这要求主 Agent 在派发任务时，明确子任务的输入边界，而不是"你自己看着办"。
-
-### 3. 结构化回收结果
-
-子 Agent 执行完毕后，只把结构化结果写回主会话，过程日志全部留在子会话内：
-
-```python
-# 子 Agent 内部：完整过程记录在 sub_session
-sub_session.messages.append(intermediate_steps)
-
-# 主会话只接收结构化摘要
-main_session.inject(
-    role="tool_result",
-    content={
-        "sub_task_id": task.id,
-        "status": "completed",
-        "summary": result.summary,     # 100-200 字的结论
-        "artifacts": result.artifacts, # 产出物引用
-        "errors": result.errors[:3],   # 只保留关键错误
-    }
-)
-```
-
-### 4. 子会话生命周期收口
-
-子任务完成后，子 session 要么立即销毁，要么标记为只读归档。不要让子 session 继续挂在主会话下面累积状态：
-
-```python
-await sub_session.close(reason="task_completed", archive=True)
-```
+   原始 trace 写到外部文件，主 session 只保留 `trace_id`。
 
 ## 踩坑点
 
-**坑一：图省事直接传主会话引用。** 子 Agent 拿到主会话的 session 对象后，一个不留神就往里写东西。最隐蔽的情况是子 Agent 调用工具时，工具回调把日志写到了全局上下文。解决：子 Agent 的工具回调必须绑定子会话的 logger。
+- **只截断不回摘要**  
+  子 Agent 如果最后只返回一个 `done` 或空结果，主会话没有决策依据。需要显式生成 outcome 摘要。
 
-**坑二：裁剪过度导致子 Agent 瞎猜。** 如果只给子 Agent 一句"处理一下这个文件"，它缺上下文就会自己编造假设。裁剪的关键不是"给得少"，而是"给得准"。至少要包含：任务目标、输入数据引用、约束条件、预期输出格式。
+- **隔离了 session，但没隔离 MCP 状态**  
+  同一个数据库 cursor、文件句柄、浏览器实例仍然可能串。给子 Agent 新建 scoped client，结束时主动 close。
 
-**坑三：结果回收格式不统一。** 有的子 Agent 返回纯文本，有的返回 JSON，有的返回文件路径。主会话面对五花八门的返回格式，后续处理很痛苦。建议定义一个统一的 `SubTaskResult` schema，所有子 Agent 必须遵守。
+- **把子 Agent verbose 日志短期接回主 session**  
+  调试时确实方便，但时间一长主会话就被错误信息污染。需要看日志时用 trace 文件查，不要回灌。
 
-**坑四：忽略了并发子 Agent 的写冲突。** 多个子 Agent 同时执行时，如果都尝试往主会话注入结果，可能出现顺序错乱。解决：主会话侧设置一个结果收集器，子 Agent 只往收集器写，由主 Agent 在收口阶段统一合并。
+- **环境变量和插件配置泄漏**  
+  主会话临时变量不要直接传给子 Agent。显式传参，用完清理，避免跨 session 留下共享状态。
 
 ## 可复用建议
 
-1. **默认隔离，显式共享**。子 Agent 的 session 默认完全独立，需要共享什么必须显式声明。把"默认继承"反过来，能避免 80% 的污染问题。
-2. **结果 schema 先行**。在写任何子 Agent 逻辑之前，先定义 `SubTaskResult` 的结构。这个 schema 是子 Agent 和主 Agent 之间的契约。
-3. **子会话要有 TTL 和归档机制**。不要信任"任务完成后手动关闭"这个动作，靠 TTL 兜底。
-4. **主会话里只保留"决策相关信息"**。问自己一个问题：这条信息如果从主会话里删掉，主 Agent 的下一步决策会变差吗？不会就删。
-5. **调试时开启会话血缘追踪**。在日志里记录每个 session 的 parent/child 关系，排障时能快速定位是哪个子 Agent 污染了主会话。
+- 主会话只保留三类信息：`goal`、`current_status`、`next_action`。
+- 子 Agent 返回控制在 800–1500 token 内，原始过程全部落盘。
+- 每个子任务都带 `trace_id`，排查问题只查 trace，不改主上下文。
+- 给子 Agent 设置独立的 MCP 命名空间和 env scope，任务结束触发清理钩子。
 
 ## 总结
 
-Session 隔离的本质是**信息边界管理**：子 Agent 需要充分的执行上下文，主 Agent 需要干净的决策上下文。这两者天然冲突，所以不能靠"自觉"来维护，要靠架构约束。四个步骤——独立 session、裁剪输入、结构化回收、生命周期收口——落地成本不高，但对多 Agent 编排的稳定性提升是实打实的。
-
-当你的 OpenClaw 编排里出现了三个以上子 Agent 时，这套东西就不是可选项了。
+session 隔离不是拒绝信息，而是改变信息回传粒度。理想的子 Agent 应该像 API：请求明确、返回结构化、内部过程可观测但不进入主上下文。这样主会话才能保持轻量，多步自动化才能稳定跑下去。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/91c3023beca4260b.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/e72a7c952a9f7c46.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/564e5c0c1e476192.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/4e982938077931bc.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/d3ce57709378cbc7.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/c52b2f2c32777838.png)
 
