@@ -1,84 +1,107 @@
 ---
 title: 本地 LLM 部署：在家用电脑上跑大模型的实践指南
-feedId: 35543
+feedId: 35559
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
-## 背景：为什么要在本地跑模型
+## 背景
 
-对 OpenClaw、Agent、MCP 与插件自动化这类实践来说，模型服务通常是云端 API。但云端 API 有成本、延迟、隐私、离线场景等限制。家用电脑本地部署 LLM，可以作为 Agent 的私有推理后端，也可用于敏感数据测试、插件调试、以及在没有公网的环境下快速原型。
+本地部署 LLM 对 OpenClaw/Agent/MCP 用户最大的价值不是“替代大厂 API”，而是获得一个固定版本、可离线、可压测的 OpenAI-compatible 端点。插件调试、MCP 工具循环、自动化脚本跑批时，本地模型能减少限流、数据外发和 token 成本。
 
-但家用电脑不是数据中心，显存和内存是硬约束。这篇记录我在一台中端家用机器上部署本地 LLM 并接入 Agent 工具链的实践过程，重点是可复用的工程化选择，而不是跑分。
+## 问题
 
-## 问题：家用环境的约束
+家用电脑常见瓶颈：显存小、内存带宽有限、模型选型不当、工具调用不稳定。很多人第一次直接下载 70B 或未量化版本，结果 OOM；或者 7B 模型在 Agent 循环里输出 JSON 崩坏，导致 OpenClaw 解析失败。
 
-最常见的配置大致两类：N 卡 8-12GB 显存（如 3060/4060/4070），或使用 CPU 推理的核显机器。直接加载 13B/14B 全精度模型基本会 OOM，7B/8B 也需要量化。同时，本地服务需要提供 OpenAI 兼容 API，方便 OpenClaw、MCP 客户端、插件脚本统一调用。另一个容易被忽略的问题是上下文长度：默认值往往偏小，影响 Agent 的多轮工具调用。
+## 做法/步骤
 
-## 做法与步骤
+### 1. 先按硬件选模型，不要贪大
 
-**1. 选型：从 GGUF 量化模型入手**
+| 可用显存 | 建议模型/量化 |
+| --- | --- |
+| 8GB | 7B-8B Q4_K_M |
+| 16GB | 13B-14B Q4/Q5 |
+| 24GB | 32B Q4 或 14B Q8 |
+| 无独显，32GB RAM | 7B-13B Q4 纯 CPU，降低并发 |
 
-个人推荐先用 llama.cpp 生态，不推荐一开始就上 vLLM。vLLM 对 CUDA 版本和算子编译要求高，适合有稳定显卡和批处理需求；llama.cpp 或 Ollama 对硬件更包容，也支持 CPU/GPU 混合推理。模型优先选 7B/8B 的 instruct 版本，量化选 Q4_K_M 或 Q5_K_M。例如 qwen2.5:7b-instruct-q4_K_M 或 llama3.1:8b-instruct-q4_K_M。
+优先选 `-instruct` 版本，不要用 base 模型做 Agent。Qwen2.5、Llama 3.1/3.2、Mistral 系列对工具调用和 JSON 输出相对更稳。
 
-**2. 启动本地 OpenAI 兼容服务**
-
-如果使用 Ollama，拉取后通过环境变量设置上下文，再启动服务：
+### 2. 用 Ollama 部署为本地端点
 
 ```bash
-OLLAMA_CONTEXT_LENGTH=8192 ollama serve
-# 拉取模型
 ollama pull qwen2.5:7b-instruct-q4_K_M
-# 运行
-ollama run qwen2.5:7b-instruct-q4_K_M
+OLLAMA_HOST=127.0.0.1:11434 OLLAMA_NUM_PARALLEL=1 OLLAMA_KEEP_ALIVE=10m ollama serve
 ```
 
-Ollama 默认会监听 `http://localhost:11434`，OpenAI 兼容端点为 `/v1`。
+固定 `OLLAMA_NUM_PARALLEL=1` 对家用 GPU 更现实，避免并发推理把显存打爆。
 
-如果使用 llama.cpp server，命令大致如下：
+### 3. 通过 Modelfile 约束输出
+
+如果模型模板不对，或 Agent 循环停不下来，可以新建 Modelfile：
+
+```text
+FROM qwen2.5:7b-instruct-q4_K_M
+PARAMETER temperature 0.0
+PARAMETER num_ctx 8192
+PARAMETER stop "Observation:"
+```
+
+然后 `ollama create local-agent -f Modelfile`。`num_ctx` 至少 8192，MCP 多轮很容易爆上下文。
+
+### 4. 接入 OpenClaw 或 MCP
+
+Ollama 提供 OpenAI-compatible 接口：
 
 ```bash
-./llama-server -m models/qwen2.5-7b-instruct-q4_k_m.gguf \
-  -ngl 999 -c 8192 --host 0.0.0.0 --port 8080
+curl http://127.0.0.1:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local-agent","messages":[{"role":"user","content":"reply json only"}],"temperature":0}'
 ```
 
-`-ngl 999` 表示尽可能把层加载到 GPU。显存不够时，可以减小到 30-40，让部分层回退到 CPU。
+在 OpenClaw 的模型配置里使用同样参数：`base_url` 指向 `http://127.0.0.1:11434/v1`，`api_key` 可填 `ollama`，模型名填 `local-agent`。
 
-**3. 接入 OpenClaw / Agent / MCP**
+### 5. Agent/MCP 工具调用建议
 
-在 OpenClaw 的模型配置中，把 `base_url` 指向本地服务，如 `http://127.0.0.1:11434/v1` 或 `http://127.0.0.1:8080/v1`。API key 可以填任意非空字符串，本地服务通常不校验。优先测试 `/v1/chat/completions` 和 `/v1/models` 两个端点，确认响应结构和字段兼容。MCP 客户端或插件脚本也可以通过环境变量 `OPENAI_BASE_URL` 复用同一本地端点。
-
-**4. 验证与调参**
-
-先用 curl 或 Python requests 做一次最小调用，确认返回的 `choices[0].message.content` 正常。调整参数时注意：本地模型对温度敏感，Agent 场景建议温度 0.1-0.3，避免工具调用格式漂移。上下文长度与显存成正比，8GB 显存 7B Q4 模型通常可以稳定到 4096-8192 token，再高可能触发 KV cache OOM。
+- MCP 工具描述保持扁平，不要嵌套太深，`required` 字段清晰。
+- 温度设为 0.0，关闭随机采样。
+- 如果 native tool_calls 不稳定，让模型输出 JSON，由 OpenClaw 插件层解析，再调用 MCP server。这比强依赖模型的 function calling 更可控。
 
 ## 踩坑点
 
-- **Ollama 默认上下文只有 2048**：很多 Agent 多轮对话或工具输出会超过这个值，导致截断或格式错误。务必显式设置 `OLLAMA_CONTEXT_LENGTH` 或在 Modelfile 中设置 `num_ctx`。
-- **显存不足时不要盲目调大 `-ngl`**：llama.cpp 把所有层都加载到 GPU 后，推理时可能因为剩余显存不够分配 KV cache 而直接 OOM。合理做法是先全 GPU 加载，如果 OOM 再逐步降低 `-ngl` 或减小 `-c`。
-- **模型输出格式不符合工具调用**：本地小模型对 function calling / JSON schema 支持不如大模型稳定。建议在 system prompt 中明确输出格式，并在 Agent 侧做一层解析容错。不要依赖模型 100% 返回合法 JSON。
-- **CPU 推理速度慢**：如果没有独显，纯 CPU 跑 7B Q4，每秒可能只有几 token。用作 Agent 后端只能做轻量工具和短回复，不要期待实时交互。
-- **端口和防火墙**：本地服务默认绑定 `127.0.0.1`，如果需要给局域网内其他机器或容器访问，要显式 `--host 0.0.0.0` 并注意安全。
+1. **Prompt template 不匹配**  
+   第三方 GGUF 导入后，Ollama 自动模板可能错。用 `ollama show --modelfile` 检查，必要时手动指定 TEMPLATE。
+
+2. **Context 默认太小**  
+   API 不传 options 时可能是 2048/4096。长任务失败先怀疑上下文长度，而不是模型笨。
+
+3. **工具调用非原生**  
+   小模型输出 JSON 可能出现尾随逗号、缺失括号。用 `format: json` 或 `response_format`，并做后处理容错。
+
+4. **Windows/WSL2**  
+   有 N 卡优先用 Windows 原生 Ollama；WSL2 里 GPU 透传和显存分配问题更多。
+
+5. **网络暴露风险**  
+   绑定 `0.0.0.0` 仅用于局域网调试，Windows 防火墙不要直接全开。
 
 ## 可复用建议
 
-1. **固定一个本地端点**：所有工具、插件、Agent 统一走 `localhost:11434/v1` 或 `localhost:8080/v1`，切换模型只需改服务端，不用改每个客户端配置。
-2. **从 7B Q4 开始，不要一上来追求大模型**：先跑通链路，再考虑换 13B/14B 或提高量化精度。
-3. **记录模型配置**：模型名、量化类型、上下文长度、温度、`-ngl` 等写入配置文件或注释，避免过几天忘记参数。
-4. **为 Agent 单独准备一个轻量模型**：如果机器还要同时跑其他任务，可以再启动一个 1.5B/3B 的模型作为指令路由或分类器，主模型只处理复杂推理。
-5. **监控显存和内存**：用 `nvidia-smi` 或 `htop` 观察加载和推理时的占用，快速判断是否需要调整分层加载。
+- 把 Modelfile、启动脚本、curl smoke test 放进仓库，固定模型 digest。
+- 本地模型只做结构化抽取、路由、简单工具选择；复杂推理回退到更大模型。
+- 每次升级模型后跑一组结构化输出用例，记录通过率。
+- 用 `ollama ps` / `nvidia-smi` 看显存和 KV cache 占用。
+- 给 OpenClaw 留 `local` 和 `cloud` 两个 profile，避免改全局配置。
 
 ## 总结
 
-家用电脑本地部署 LLM 不是替代云端 API，而是提供一种可控、离线、低成本的私有推理端点。对于 OpenClaw、Agent、MCP 和插件自动化实践，它的价值在于让整套工具链在没有外部依赖时依然能跑通、能调试。务实路线是：7B/8B 量化模型 + llama.cpp/Ollama + OpenAI 兼容 API + 显式上下文长度，先跑通，再按需调整。不要被“在家跑大模型”的噱头带偏，工程化的关键是稳定的端点、明确的资源边界和可复用的配置。
+本地 LLM 部署不是一次性下载模型，而是把“模型端点”当作工程组件管理：固定量化版本、限定上下文、约束输出、测试工具调用。对 OpenClaw/Agent/MCP 用户，本地端点在离线调试、插件开发和批量结构化任务里非常实用，但复杂推理要控制预期。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/c951cc86fccee9f9.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/a743b20792e5f75a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/7dcb4ae10c7c97c5.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/8e78d75edc55a9a4.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/37d3e08c0d9c60b0.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/f1304f7b458dc946.png)
 
