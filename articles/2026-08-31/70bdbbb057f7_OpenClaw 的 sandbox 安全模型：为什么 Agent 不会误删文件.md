@@ -1,71 +1,118 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 35513
+feedId: 35516
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
 ## 背景
 
-不少 OpenClaw 用户把文件读写、shell、MCP 工具接给 Agent 后，最担心的不是“能力不够”，而是误操作：把源码目录当临时目录删掉、覆盖配置、执行一条看起来安全的 `rm -rf`。OpenClaw 的应对方式不是让模型“更小心”，而是给工具调用增加一层可验证的边界。
+在 OpenClaw 上跑文件整理、批量重命名、日志清理或 MCP 工具时，最担心的不是 Agent 做不了，而是它“太敢做”。一个错误的目标路径、一段失控的 `rm -rf`、插件拿到过宽的工作目录，都可能让本地文件直接消失。
 
-## 问题不在模型一次都不出错
+OpenClaw 的 sandbox 不是传统虚拟机或容器级隔离，更接近一个**可执行策略层 + 动作拦截层**。它的目标不是把 Agent 关进完全与外界无关的黑盒，而是让 Agent 的读写、删除、覆盖等动作经过明确边界和授权检查。
 
-Agent 的工具调用来自上下文推理，路径可能由模型生成，也可能来自插件或 MCP 返回。问题在于：如果本地脚本以当前用户身份运行，shell 工具就能碰到任何路径。模型一旦把 `~/repo` 和 `~/repo/backup` 理解反了，传统脚本会直接执行。真正的风险不是 AI 会犯错，而是错误发生时系统没有拦截点。
+## 问题路径
+
+常见误删主要来自三条路径：
+
+1. **路径越界**：Agent 生成了 `../../` 或绝对路径，跳出工作目录。
+2. **命令直通**：通过 shell 执行 `rm`、`move`、`shutil.rmtree` 等，没有经过权限判断。
+3. **MCP/插件权限过大**：第三方 MCP server 拿到整个用户目录，错误工具调用直接破坏外部文件。
 
 ## 做法/步骤
 
-OpenClaw 的 sandbox 安全模型可以拆成三层：路径边界、操作策略、人工审批。
+在 OpenClaw 中，建议把 sandbox 配置成一套组合策略。
 
-1. **固定可访问根目录**  
-   文件工具只接受配置的 `WORKSPACE_ROOT` 或 `ALLOWED_ROOTS` 下的路径。工具执行前先做路径规范化，比较前缀；遇到 `..`、绝对路径逃逸、符号链接指向外部路径时直接拒绝。
+### 1. 建立独立 workspace
 
-2. **删除动作改写**  
-   危险的 `delete` 不直接 `unlink`。OpenClaw 可以将删除动作改写为移动到带时间戳的 `.trash` 目录，例如 `~/.openclaw/trash/2026-...`。只有显式开启“硬删除”且通过审批时才执行真正的 `rm`。
+不要用 `~` 或系统根目录作为工作区。单独建目录：
 
-3. **按操作分级审批**  
-   读、写、覆盖、删除四种操作可以配置不同策略。常见配置是：读自动放行，写受限，覆盖和删除需要人工确认，批量删除需要额外确认。
+```bash
+mkdir -p /home/user/agent-workspace/projects
+```
 
-4. **MCP 工具白名单**  
-   不是所有 MCP server 都值得信任。OpenClaw 侧只暴露白名单工具，并限制参数范围。尤其不要默认把 `shell.run`、`fs.delete`、`fs.move` 全部开放给 Agent。
+### 2. 限制可写路径
 
-示意配置如下，实际字段名以当前版本为准：
+OpenClaw sandbox 支持把写入范围限制在 workspace 内。即使 Agent 尝试写外部路径，动作层也会拒绝：
 
 ```yaml
 sandbox:
-  roots: ["~/openclaw-data"]
-  deny_ops: ["rm", "rmdir", "unlink"]
-  trash_dir: "~/.openclaw/trash"
-  require_approval: ["delete", "overwrite"]
+  root: /home/user/agent-workspace
+  writable_paths:
+    - /home/user/agent-workspace/projects
+  allow_read_outside: false
+```
+
+### 3. 对删除类动作开启拦截
+
+不要直接给永久删除权限。优先使用回收站策略，并要求确认：
+
+```yaml
+sandbox:
+  delete_policy: trash
+  confirm_required:
+    - delete
+    - move
+    - overwrite
+  default_allow: false
+```
+
+这意味着 `rm`、覆盖写、移动路径等动作会先进入待确认状态，Agent 必须给出目标、来源和原因，由策略层或人工确认。
+
+### 4. 先 dry-run，后真实执行
+
+批处理文件和清理任务先跑 dry-run。OpenClaw 的 action layer 可以只记录动作计划，不实际落盘：
+
+```yaml
+sandbox:
+  dry_run: true
+```
+
+查看动作日志，确认没有越界路径或误匹配后再切换为 `dry_run: false`。
+
+### 5. MCP/插件按最小权限注册
+
+MCP tool 和插件不要挂载整个 home。给每个工具显式声明可用目录和动作：
+
+```yaml
+mcp_tools:
+  - name: file_cleaner
+    allowed_paths:
+      - /home/user/agent-workspace/projects
+    allowed_actions:
+      - read
+      - move_to_trash
+    allow_delete: false
 ```
 
 ## 踩坑点
 
-- **根目录给太大**：把 `~` 或 `/` 加进 roots，等于没设边界。
-- **符号链接逃逸**：`/data/link` 可能指向 `/etc`。要先 `resolve` 真实路径，再做前缀比较。
-- **MCP server 不一定遵守同一 sandbox**：外部 MCP 进程可能用自己的用户和路径权限，应放进容器或限制其可访问路径。
-- **shell 别名绕过**：就算 `delete` 被拦截，`bash -c 'rm -rf ...'` 仍能绕过文件工具。需要禁止 shell 或让 shell 在更底层隔离环境中运行。
-- **审批疲劳**：所有删除都弹确认，用户会逐渐无脑点同意。应只对高风险目录启用人工审批，低风险目录用 trash 兜底。
+- **symlink 逃逸**：如果 workspace 里存在软链接指向外部目录，仅靠根目录限制可能被绕过。需要禁止跟随 workspace 外的 symlink，或对 symlink 单独授权。
+- **dry-run 不是万能的**：dry-run 只能发现动作计划中的问题，无法覆盖真实执行时文件被占用、权限变化、目录已改变等情况。
+- **trash 不代表安全**：如果某些外部工具绕过 OpenClaw 策略层直接操作文件，回收站策略不会生效。所有文件操作都应从 Agent 的动作通道走。
+- **不要只靠 prompt 约束**：在系统提示词里写“不要删除文件”不能作为安全边界。必须让策略层成为默认拒绝的关卡。
+- **日志和恢复**：开启动作审计日志。出现误操作后，先停止 Agent，根据日志确认动作链，从 trash 或 snapshot 恢复，而不是再让 Agent 尝试“修回去”。
 
 ## 可复用建议
 
-- Agent 的数据目录不要直接放在代码仓库里，使用独立的 `~/openclaw-agent-data`。
-- 重要目录保留版本控制或定时快照，sandbox 不是备份替代品。
-- 放一个 canary 文件，如 `DO_NOT_DELETE`，定期测试工具是否真的拒绝删除。
-- 每周抽看一次审计日志，关注“拒绝的操作”和“已进入 trash 的文件”。
-- sandbox 是权限边界和调度策略，不是内核隔离。要执行不可信命令，仍需容器、虚拟机或 landlock/seccomp 等机制。
+1. 默认拒绝，显式允许。
+2. workspace 独立、可写范围最小化。
+3. 删除动作一律走 trash，不直接永久删。
+4. 破坏性动作先 dry-run，再小批量执行。
+5. MCP/插件按工具粒度授权，不允许继承整个用户目录。
+6. 保留动作审计日志，做可回滚的 snapshot。
 
 ## 总结
 
-OpenClaw 的 sandbox 模型不是承诺“AI 永不犯错”，而是把文件操作变成受限请求：路径不对就拒绝，删除先入 trash，高风险操作需要人工确认。因此“不会误删文件”更准确的说法是：未经允许的路径删不掉，已授权的删除可恢复、可审计。
+OpenClaw 的 sandbox 之所以能让 Agent 不那么容易误删文件，核心不是“Agent 变聪明了”，而是文件操作被塞进了一个默认拒绝的通道。删除、覆盖、移动都必须经过显式策略、路径边界和确认机制。即便如此，误删只能被降低概率，不能被完全消灭。工程上的安全来自边界设计、最小权限和可恢复能力，而不是对模型判断力的信任。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/4219c4780b3d1131.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/08a08dd43e99112c.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/d494a3fbd9c1ef18.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/71e8175052c5be25.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/7b352b9e5f6cb2be.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/4f766bdf2417d20d.png)
 
