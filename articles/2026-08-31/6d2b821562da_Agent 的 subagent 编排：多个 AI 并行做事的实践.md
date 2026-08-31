@@ -1,94 +1,85 @@
 ---
 title: Agent 的 subagent 编排：多个 AI 并行做事的实践
-feedId: 35436
+feedId: 35505
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
 ## 背景
 
-在 OpenClaw 这类 Agent/自动化链路里，单个主 Agent 串行处理多个任务时，常会遇到三个问题：响应慢、上下文膨胀、一个任务失败拖垮整条流程。比如同时调研多个开源项目、并行检查多个模块的 SQL、批量跑测试等场景，串行做法会非常耗时。
+单 Agent 在处理长链路任务时，容易陷入三种困境：上下文膨胀、工具调用串行阻塞、局部失败污染全局。比如让一个 Agent 同时做网页抓取、数据清洗、报告生成，它很可能在某个工具超时后反复重试，最后带着半成品结果继续跑，输出不可信。
 
-subagent 编排的思路是把大任务拆成边界清晰的子任务，主 Agent 只做分发、校验和汇总，多个 subagent 并行执行。它的价值不是“更多 AI 一起聊天”，而是任务分片、上下文隔离和更好的失败控制。
+在 OpenClaw / Agent / MCP 这类自动化场景里，一旦流程变长，主 Agent 的推理链会越来越重。最常见的表现是：越到后面越容易丢步骤、改错文件、重复调用同一个工具，或者把失败结果当成成功结果继续写。
 
 ## 问题
 
-并行不是银弹。真正的难点不在“能不能同时跑”，而在：
+如果要让多个 AI 并行做事，真正难点不是“同时调几个模型”，而是：
 
-- 子任务是否真的无依赖，能不能并行；
-- subagent 是否会乱调工具、产生大量无效输出；
-- 并行结果如何汇聚、失败如何重试；
-- 上下文和 token 成本是否反而增加。
+- 怎么拆任务才不会互相依赖？
+- 主 Agent 如何不成为瓶颈？
+- 并行结果回来了怎么合并、校验、仲裁？
+- 某个 subagent 失败后，如何避免拖垮整条链路？
 
-## 做法/步骤
+## 做法 / 步骤
 
-### 1. 先判断是否适合并行
+### 1. 定义 Worker 边界
 
-适合并行的任务通常满足：输入独立、输出可结构化、无共享写状态、可幂等重试。比如“同时调研三个项目”“并行检查五个模块的 SQL 文件”。如果任务之间有强依赖，先画 DAG，不要强行并行。
+每个 subagent 只负责一个可独立验证的任务。比如代码审计 worker、文档提取 worker、测试用例生成 worker。不要让 subagent 读全量文件并直接总结，应该由 supervisor 先切好切片再分发。
 
-### 2. 把 subagent 声明成最小能力单元
+### 2. Supervisor 只做三件事
 
-不要给每个 subagent 继承主 Agent 的全部工具。按角色裁剪工具、迭代次数和输出格式。一个示意配置：
+拆任务、派发、收口。Supervisor 不直接改文件、不生成最终长文。它维护一个任务队列，把任务描述、输入引用、schema 约束打包成结构化 JSON 后派发给 worker。
 
-```yaml
-subagents:
-  searcher:
-    tools: [web_search, read_file]
-    max_iterations: 8
-    result_schema:
-      type: object
-      properties:
-        summary: string
-        sources: array
-  reviewer:
-    tools: [read_file, run_tests]
-    max_iterations: 10
-    result_schema:
-      type: object
-      properties:
-        verdict: string
-        issues: array
+### 3. 通信走结构化结果
+
+subagent 返回的必须是统一结构，例如：
+
+```json
+{
+  "task_id": "task_012",
+  "status": "ok",
+  "data": {},
+  "errors": []
+}
 ```
 
-### 3. 主 Agent 只做分发和合并
+不要让 subagent 返回自然语言“我觉得大概可以了”。结构化结果才能做校验和合并。
 
-主 Agent 的职责是拆解输入、调度 subagent、校验返回值、写最终结果。不要在主 Agent 里重复 subagent 的细节工作。可以通过 MCP 工具或本地 spawn 调用 subagent，优先使用结构化输入输出，避免自然语言来回转述。MCP 服务的好处是 subagent 可以独立重启、限流和升级，不会拖死主进程。
+### 4. 并行执行用 worker pool
 
-### 4. 并发控制与超时
+在 OpenClaw 这类环境里，可以把每个 subagent 封装成 MCP 工具或插件调用。并行时使用异步任务队列，不要在主 Agent 的同一个上下文里循环等待。主 Agent 只负责派发和收口，不参与具体执行。
 
-同时跑 20 个 subagent 通常会触发限流或上下文失控。一般建议 3-6 个并发，按批处理。为每个 subagent 设置 `timeout`、`max_tokens` 和 `max_iterations`。
+### 5. 汇聚时先校验再拼装
 
-### 5. 结果只回传摘要
-
-subagent 的最终返回应该是一个小体积 JSON 摘要，而不是完整日志或原文。需要原文时只返回文件路径或引用片段，由主 Agent 按需读取。
+对每个结果做 schema 校验、非空检查、字段完整性检查。失败的 worker 可以重试一次，超过次数就走降级路径，例如返回“该模块未能生成”，而不是继续编造内容。
 
 ## 踩坑点
 
-- **工具过多导致乱调**：subagent 拿到一堆用不上的工具，容易在错误路径上消耗迭代次数。按任务最小化工具权限。
-- **共享文件冲突**：多个 subagent 同时写同一个文件或同一张表，很容易出现覆盖和脏数据。尽量每个 subagent 写独立目录，主 Agent 最后合并。
-- **上下文爆炸**：subagent 返回大量无用内容，主 Agent 上下文快速耗尽。必须约定结果 schema 和长度上限。
-- **重试没有退避**：失败就立即重试，遇到限流会更严重。加重试退避和最大重试次数。
-- **可观测性差**：并行任务出错后只看到一堆报错，分不清哪个 subagent、哪个输入失败。给每次运行加 trace id。
+- **上下文爆炸**：subagent 若被传入整份文档，很快就会把 token 吃光。正确做法是 supervisor 先做拆分，只传必要切片。
+- **并发写冲突**：多个 worker 同时写同一个文件或数据库 key，会出现覆盖。必须让 worker 只写自己的独立路径，由 supervisor 最后合并。
+- **失败重试放大**：设置最大重试次数，并给每次重试加随机退避，避免某个工具限流后所有 worker 一起重试。
+- **提示词互相污染**：不要所有 worker 共用一个 system prompt。每个 worker 的 prompt 应只描述自己的任务和输出格式，避免它“顺手”做别人该做的事。
+- **无限递归**：subagent 再调用 subagent 时，必须限制最大深度，否则会出现树状爆炸。
 
 ## 可复用建议
 
-- 把“并行分发-结果汇总”封装成一个固定流程，只替换 subagent 定义和输入模板。
-- 小任务用 map-reduce 模式：主 Agent 分发，subagent 返回摘要，主 Agent 合并成最终报告。
-- 使用 JSON schema 校验 subagent 输出，不合规就重试一次。
-- 关键操作给 subagent 只读权限，写操作统一放在主 Agent 或专门的工作目录。
-- 记录每个 subagent 的耗时、token 用量和失败原因，便于后续裁剪任务。
+- 先在串行模式下跑通全部任务，再开启并行；并行只改变调度，不改变单个任务逻辑。
+- 给每个 subagent 设置 token 上限、超时、最大重试次数。
+- 所有派发记录带 task_id 和 parent_id，便于追踪是哪一层、哪个任务失败。
+- 在 supervisor 层做结果去重和冲突仲裁，尤其是多个 worker 可能返回相似内容时。
+- 把 subagent 封装成可复用的 MCP 工具或插件，输入输出 schema 固定，便于版本演进。
 
 ## 总结
 
-subagent 编排的价值在于任务分片和上下文隔离，而不是单纯堆叠 AI 数量。工程上先做任务拆分，再做权限裁剪，最后做结果校验和并发控制。并行能提效，但只有把边界、超时、重试和日志做好，才真正可维护。
+Subagent 编排的核心不是“同时跑多个模型”，而是把复杂任务拆成可验证、可隔离、可并行的小任务，并用结构化协议收口。工程上的关注点应放在边界定义、失败隔离和结果校验上。这样做出来的并行 Agent 系统才稳定，不会因为一个 worker 的异常拖垮整条链路。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/a55513069e9f8508.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/738f407c867114bb.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/d383b617f7e2880d.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/1caf108448e6fcfb.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/b32cf4799834a78f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/beb84e5724768a4f.png)
 
