@@ -1,85 +1,63 @@
 ---
 title: Agent 的 subagent 编排：多个 AI 并行做事的实践
-feedId: 35505
+feedId: 35576
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
 ## 背景
+单个 Agent 处理复杂任务时容易遇到三类问题：上下文膨胀、工具权限混杂、串行等待。比如要同时调研三个仓库、审查五个接口、生成两份报告，如果都塞进主 Agent，中间结果会互相污染，一个节点失败还可能带崩整条链路。
 
-单 Agent 在处理长链路任务时，容易陷入三种困境：上下文膨胀、工具调用串行阻塞、局部失败污染全局。比如让一个 Agent 同时做网页抓取、数据清洗、报告生成，它很可能在某个工具超时后反复重试，最后带着半成品结果继续跑，输出不可信。
+subagent 编排的思路是把任务拆成多个独立 worker，主 Agent 只负责分发、校验和汇总。OpenClaw 里可以通过子任务/Agent 工具实现，配合 MCP 提供统一资源访问。
 
-在 OpenClaw / Agent / MCP 这类自动化场景里，一旦流程变长，主 Agent 的推理链会越来越重。最常见的表现是：越到后面越容易丢步骤、改错文件、重复调用同一个工具，或者把失败结果当成成功结果继续写。
+## 什么任务适合并行
+适合：无强依赖、共享只读资源、输出可结构化合并。
 
-## 问题
+不适合：强顺序依赖、需要实时协商、共享可变状态。
 
-如果要让多个 AI 并行做事，真正难点不是“同时调几个模型”，而是：
+判断标准很简单：如果拆开后每个 worker 的输入输出边界清晰，且不需要中途互相等，就可以并行。
 
-- 怎么拆任务才不会互相依赖？
-- 主 Agent 如何不成为瓶颈？
-- 并行结果回来了怎么合并、校验、仲裁？
-- 某个 subagent 失败后，如何避免拖垮整条链路？
+## 做法
+1. 任务契约  
+给每个 subagent 一个明确 schema，例如：
+`{"goal": "...", "tools": ["read_github"], "output": "JSON only", "max_steps": 8}`  
+输出要求只返回 JSON/Markdown，不输出解释。主 Agent 写任务时明确“不要补充建议、不要改格式”。
 
-## 做法 / 步骤
+2. 上下文隔离  
+每个 subagent 只注入任务相关材料，不全量灌文档。工具权限最小化：读 GitHub 的只给 read，写文件的只给指定目录。共享 MCP server 时用独立 session，避免 rate limit 互相影响。
 
-### 1. 定义 Worker 边界
+3. 并行执行  
+主 Agent 一次性 dispatch 3-5 个 subagent，设置 timeout 60-120s、max_steps 限制。异步等待结果，不阻塞交互。OpenClaw 的 agent 工具可以做并发，但每个 subagent 的任务 prompt 要独立，不要引用主对话里的隐含信息。
 
-每个 subagent 只负责一个可独立验证的任务。比如代码审计 worker、文档提取 worker、测试用例生成 worker。不要让 subagent 读全量文件并直接总结，应该由 supervisor 先切好切片再分发。
+4. 结果校验  
+主 Agent 按 schema 校验字段完整性。缺字段或 JSON 解析失败时，只对失败节点重试一次，重试 prompt 里加“previous output invalid, return only JSON”。
 
-### 2. Supervisor 只做三件事
-
-拆任务、派发、收口。Supervisor 不直接改文件、不生成最终长文。它维护一个任务队列，把任务描述、输入引用、schema 约束打包成结构化 JSON 后派发给 worker。
-
-### 3. 通信走结构化结果
-
-subagent 返回的必须是统一结构，例如：
-
-```json
-{
-  "task_id": "task_012",
-  "status": "ok",
-  "data": {},
-  "errors": []
-}
-```
-
-不要让 subagent 返回自然语言“我觉得大概可以了”。结构化结果才能做校验和合并。
-
-### 4. 并行执行用 worker pool
-
-在 OpenClaw 这类环境里，可以把每个 subagent 封装成 MCP 工具或插件调用。并行时使用异步任务队列，不要在主 Agent 的同一个上下文里循环等待。主 Agent 只负责派发和收口，不参与具体执行。
-
-### 5. 汇聚时先校验再拼装
-
-对每个结果做 schema 校验、非空检查、字段完整性检查。失败的 worker 可以重试一次，超过次数就走降级路径，例如返回“该模块未能生成”，而不是继续编造内容。
+5. 合并与写操作收敛  
+读和分析放在 subagent，写操作尽量集中到主 Agent 最后执行。若 subagent 必须写，要求幂等：创建前先检查是否存在，写入用临时文件再原子替换。
 
 ## 踩坑点
-
-- **上下文爆炸**：subagent 若被传入整份文档，很快就会把 token 吃光。正确做法是 supervisor 先做拆分，只传必要切片。
-- **并发写冲突**：多个 worker 同时写同一个文件或数据库 key，会出现覆盖。必须让 worker 只写自己的独立路径，由 supervisor 最后合并。
-- **失败重试放大**：设置最大重试次数，并给每次重试加随机退避，避免某个工具限流后所有 worker 一起重试。
-- **提示词互相污染**：不要所有 worker 共用一个 system prompt。每个 worker 的 prompt 应只描述自己的任务和输出格式，避免它“顺手”做别人该做的事。
-- **无限递归**：subagent 再调用 subagent 时，必须限制最大深度，否则会出现树状爆炸。
+- 并行数不要贪多：3-5 个比较稳，过多会放大 token 消耗和输出方差。
+- MCP 工具冲突：多个 subagent 共用同一 server 时可能出现限流或认证冲突，建议每 worker 独立 session 或加队列。
+- 输出格式漂移：模型会漏字段、加解释文字，主 Agent 不要直接信任，用 JSON schema 校验。
+- 隐蔽串行：汇总阶段主 Agent 读取所有结果，如果结果很长，主上下文又会爆。让 subagent 输出摘要，详细结果落到文件或队列。
+- 循环依赖：用 DAG 拆任务，只做一层并行，避免 subagent 再嵌套 subagent 过深。
 
 ## 可复用建议
-
-- 先在串行模式下跑通全部任务，再开启并行；并行只改变调度，不改变单个任务逻辑。
-- 给每个 subagent 设置 token 上限、超时、最大重试次数。
-- 所有派发记录带 task_id 和 parent_id，便于追踪是哪一层、哪个任务失败。
-- 在 supervisor 层做结果去重和冲突仲裁，尤其是多个 worker 可能返回相似内容时。
-- 把 subagent 封装成可复用的 MCP 工具或插件，输入输出 schema 固定，便于版本演进。
+- 建模板：`researcher`、`reviewer`、`coder`、`formatter` 四个基础角色，按权限和输出 schema 复用。
+- 主 Agent 用状态机：plan -> dispatch -> collect -> validate -> merge -> report，失败节点单独重试。
+- MCP 统一资源访问：subagent 不直连 API，减少密钥散落。
+- 先跑 2 个并行验证契约，再放大规模。
 
 ## 总结
-
-Subagent 编排的核心不是“同时跑多个模型”，而是把复杂任务拆成可验证、可隔离、可并行的小任务，并用结构化协议收口。工程上的关注点应放在边界定义、失败隔离和结果校验上。这样做出来的并行 Agent 系统才稳定，不会因为一个 worker 的异常拖垮整条链路。
+subagent 编排本质是并发工程：任务有边界、契约清晰、失败可重试、写操作收敛。OpenClaw 适合做分发，但稳定性来自约束，而不是 prompt 技巧。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/738f407c867114bb.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/9d82b484eb2438e1.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/1caf108448e6fcfb.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/3e3c5343e6393a6a.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/beb84e5724768a4f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/b05804e5c9bfbc4a.png)
 
