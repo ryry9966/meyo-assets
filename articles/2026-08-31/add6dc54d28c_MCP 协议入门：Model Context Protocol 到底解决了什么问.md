@@ -1,110 +1,91 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 35495
+feedId: 35563
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
-# MCP 协议入门：Model Context Protocol 到底解决了什么问题
+## 背景：不是新模型，是新的接线方式
 
-## 一、背景：Agent 连接外部世界的老问题
+MCP 全称 Model Context Protocol，最早由 Anthropic 提出。它解决的不是“模型变强”的问题，而是 Agent 工具集成的工程问题：同一个知识库、同一个内部 API，如何只写一次，就能被 OpenClaw、其他 Agent Host 或 CLI 复用。
 
-在 OpenClaw、Agent 或者各种插件自动化项目里，几乎每个实践者都会遇到同一个问题：模型（LLM）需要访问外部数据、调用工具、读写文件或查询 API，但每接入一个新工具，就要写一套新的胶水代码。这个工具用 HTTP + JSON，那个工具要走私有 SDK，另一个可能是命令行。模型侧同样麻烦：OpenAI 的 function calling、Claude 的 tool use、本地模型的约束格式各不相同。最终结果是 O(N×M) 的适配成本，切换模型或工具都要返工。
+在没有 MCP 时，常见链路是：每个宿主都要为工具写 adapter，N 个工具 × M 个宿主，出现一堆胶水代码。OpenClaw 作为 Agent Host，最需要的不是把调用 JSON 包装得更好看，而是有一套统一的发现、调用、读取资源和提示词模板的协议。MCP 把这层约定固定下来。
 
-Model Context Protocol（MCP）就是在这个背景下产生的开放协议，由 Anthropic 提出，目标是定义一个统一接口：模型侧只对接一个 MCP client，工具/数据源侧只实现一个 MCP server，两端通过标准 JSON-RPC 消息通信。它解决的问题，本质上就是**模型与外部上下文之间的集成碎片化**。
+## MCP 实际解决的三件事
 
-## 二、具体问题拆解
+1. **统一发现**：通过 `tools/list`、`resources/list`、`prompts/list`，宿主能知道一个 server 有什么能力，而不是写死函数表。
+2. **统一调用**：基于 JSON-RPC 2.0，使用标准消息，不同语言实现可以互通。
+3. **统一生命周期**：初始化、能力协商、心跳/关闭，让宿主和服务端不靠隐式约定。
 
-在引入 MCP 之前，典型痛点包括：
+角色上要分清：
 
-- **胶水代码爆炸**：每个工具都要写独立的 adapter，维护量随工具数量线性甚至平方增长。
-- **上下文格式不统一**：工具返回的数据可能是纯文本、JSON、二进制流，模型侧需要手动拼接成 prompt，容易出错。
-- **权限与安全各搞一套**：每个集成自己处理认证和权限，不一致也不易审计。
-- **生态隔离**：A 框架写的工具无法直接用在 B 框架上，重复造轮子现象严重。
+- **Host**：OpenClaw 这类宿主程序；
+- **Client**：Host 内到某一个 server 的连接；
+- **Server**：实际提供 Tools、Resources、Prompts 的进程或服务。
 
-MCP 通过定义三个核心原语——**Resources（资源，如文件、数据库记录）**、**Tools（工具，可执行的函数）**、**Prompts（提示模板）**——以及标准传输协议，把这些难题收敛到一个协议层。
+其中 Tools 是动作，例如查询、创建；Resources 是数据，例如文件、知识库、工单；Prompts 是可复用提示模板。
 
-## 三、入门步骤：从零跑通一个 MCP Server
+## 做法：先跑一个最小的 stdio server
 
-以本地 Python 环境为例（面向已经熟悉 Agent 的读者）：
+建议第一版不要上 HTTP，直接用 stdio。以下是一个最小 Python MCP server 骨架：
 
-1. **安装 SDK**  
-   `pip install mcp`（官方 Python SDK，也可以选择 TypeScript 版本）。注意固定版本，当前 MCP 还在快速迭代，不同小版本之间可能有 breaking changes。
+```python
+from mcp.server.fastmcp import FastMCP
 
-2. **写一个最小 server**  
-   创建一个 `echo_server.py`，用 `mcp.server` 注册一个 tool，比如 `echo`，接收字符串参数并原样返回。代码不超过 30 行。
+mcp = FastMCP("demo")
 
-3. **用 stdio 启动**  
-   MCP 默认推荐 stdio 传输：server 作为子进程启动，通过标准输入/输出与 client 交换 JSON-RPC 消息。运行 `python echo_server.py` 即可。
+@mcp.tool()
+def echo(text: str) -> str:
+    """返回去除首尾空格后的文本；只读，无副作用。"""
+    return text.strip()
 
-4. **在 client 中配置连接**  
-   如果你是 OpenClaw 或类似 Agent 框架的用户，检查框架是否内置 MCP client 支持。以 Claude Desktop 为例，在配置文件中添加：
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
 
-   ```json
-   {
-     "mcpServers": {
-       "echo": {
-         "command": "python",
-         "args": ["/path/to/echo_server.py"]
-       }
-     }
-   }
-   ```
+在 OpenClaw 中注册的方式通常是声明一个 `mcpServers` 配置：
 
-   重启 client，就能在工具列表里看到 `echo`，并直接调用。
+```json
+{
+  "mcpServers": {
+    "demo": {
+      "command": "python",
+      "args": ["-m", "my_mcp_server"]
+    }
+  }
+}
+```
 
-5. **验证**  
-   在对话中触发一次工具调用，观察返回结果是否符合预期。如果能看到工具被正确识别并执行，说明 MCP 链路已经打通。
+注册后先做 smoke test：确认 `tools/list` 能看到 `echo`，再让 Agent 用一句话调用。比如输入“用 echo 处理一下 `  hello  `”，模型应当能选择工具并完成调用。
 
-## 四、踩坑点
+## 踩坑点
 
-实际落地中，下面几个坑出现频率较高：
+- **stdout 必须留给协议**。stdio server 的所有日志要写 stderr，否则会污染 JSON-RPC，导致 host 解析失败。
+- **描述就是选路信息**。不要把 tool 名称写成 `get` 或 `handle`。模型只能靠 name + description + schema 判断该不该调用、怎么调用。
+- **不要混淆 Resources 和 Tools**。只读数据用 resource；会产生写操作的，必须做成 tool，并标记副作用。
+- **不要过早在远程 HTTP 上做复杂鉴权**。先本地 stdio 验证能力，再切 Streamable HTTP，并加 TLS、token、最小权限。
+- **大结果不要直接塞进 tool result**。返回一个 resource URI 或摘要，让宿主按需拉取。
+- **写操作要可确认**。删除、发送、审批类工具应单独拆分，不要和查询混合在一个 tool 里。
 
-- **stdio vs SSE/HTTP 混淆**  
-  stdio 只适合本地单机。跨机器调用需要 SSE 或 HTTP 传输，配置方式完全不同，而且需要处理 CORS、反向代理等。不要想当然以为 stdio 配置能直接迁移。
+## 可复用建议
 
-- **版本兼容**  
-  MCP 协议本身和 SDK 都在快速变化，不同 client 支持的版本可能不一致。建议在项目里用 `requirements.txt` 或 `package.json` 锁定 SDK 版本，并在升级前先看 changelog。
+- 命名用 `动词_名词`，例如 `search_customer`、`create_ticket`。
+- 每个 tool 描述包含：用途、输入、输出、是否只读、失败时返回什么。
+- 用 JSON Schema 约束参数，减少模型幻觉参数。
+- 给资源设计稳定 URI，不要用临时路径作为 ID。
+- 先用 `tools/list` 验证注册，再用真实 Agent 做最小闭环，最后才加复杂逻辑。
 
-- **子进程环境变量**  
-  server 作为子进程启动时继承 client 的环境变量，但有些 client 会重置环境，导致路径或 API key 丢失。调试时先手动运行 server 确认能独立工作，再排查 client 环境。
+## 总结
 
-- **权限失控**  
-  MCP server 一旦被 client 连接，就拥有该 client 赋予的全部能力，可能读写任意文件或访问网络。生产环境必须做最小权限控制，例如用 Docker 隔离、限制可访问目录、增加审计日志。
-
-- **超时与并发**  
-  工具调用可能因为网络或计算而卡住，client 要有超时和重试机制。部分 MCP server 对并发请求支持不好，需要串行化或加锁。
-
-## 五、可复用建议
-
-1. **优先复用社区 server**  
-   官方和社区已经提供了 filesystem、fetch、git、sqlite 等通用 server。在 OpenClaw 项目里，先把这些现成能力接上，验证稳定性，再考虑写自己的业务 server。
-
-2. **自研业务 server 用 Docker 打包**  
-   统一运行环境，避免依赖冲突，也便于部署和权限隔离。stdin/stdout 可以映射到容器内，不影响传输。
-
-3. **配置版本化**  
-   把 MCP server 的配置文件（JSON/YAML）放进 Git 仓库，和项目一起管理。记录每个 server 的版本、参数、权限范围。
-
-4. **日志与可观测性**  
-   在 server 端输出结构化日志，记录每次工具调用的参数、返回时间、错误信息。这对排查“模型说调用了但实际没生效”这类问题非常有用。
-
-5. **渐进式引入**  
-   不要一次性把所有工具都迁移到 MCP。先从一两个高频、低风险的工具开始，跑通闭环后再扩展。MCP 适合做标准化接口，但不是万能的，复杂业务逻辑仍需在 server 内部处理。
-
-## 六、总结
-
-MCP 解决的核心问题是**降低模型与外部工具/数据源之间的集成成本**，通过标准协议把碎片化的适配工作收敛为一次实现、多处复用。对于 OpenClaw、Agent、插件和自动化实践者来说，它最有价值的场景是：当你有多个工具需要被不同模型或框架调用时，统一成 MCP server 能显著减少重复开发。
-
-但它也不是银弹：协议本身还在演进，安全、版本、超时等工程问题依然需要认真处理。务实的态度是把它当作一个可选的标准化层，按需引入，同时保留对底层工具的直接控制能力。先把一个 echo server 跑起来，再慢慢迁移，往往比一开始就设计大而全的方案更靠谱。
+MCP 不是 Agent 的“大脑升级”，而是把工具、数据和提示模板从宿主绑定中抽出来。它的核心价值是把 M×N 的集成成本降为 M+N。对 OpenClaw 用户来说，最重要的是先理解 Host/Client/Server 和 Tools/Resources/Prompts 的边界，然后从一个小而明确的 stdio server 开始。不要一上来追求大而全的平台化，先让一个工具可发现、可调用、可调试，再谈扩展。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/d6fee1ca44d044ff.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/8c0d6f6131a11cd7.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/066c48b0af7fb12d.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/381cb639d0ea4827.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/6ace4973d227b06c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/6b5cfc77f8e35920.png)
 
