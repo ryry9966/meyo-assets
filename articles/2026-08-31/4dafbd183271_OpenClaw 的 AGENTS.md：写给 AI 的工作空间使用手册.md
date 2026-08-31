@@ -1,137 +1,126 @@
 ---
 title: OpenClaw 的 AGENTS.md：写给 AI 的工作空间使用手册
-feedId: 35509
+feedId: 35550
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
-## 背景：为什么需要一个给 AI 看的“使用手册”
+## 背景
 
-OpenClaw 作为工作空间智能体，默认情况下每次新会话都像一个刚入职的临时工：它有能力，但不了解你的项目结构、命令习惯、环境边界。你可能遇到过这些情况：
+在 OpenClaw 这类以工作空间为边界的 Agent 环境里，AI 不只是回答单个问题，而是会在一个真实目录里持续执行任务：阅读文件、改代码、跑命令、调用 MCP 工具。问题在于，AI 每次进入工作空间时，并不天然知道这个仓库的结构、约定和红线。
 
-- 在 monorepo 里直接跑根目录 `install`，而不是进入子包；
-- 分不清 dev / staging / prod 环境变量，差点把生产配置改掉；
-- 明明接好了 MCP 和插件，却乱调用工具，或者完全不敢调用；
-- 每次开新会话都要重复解释“这个目录不能动”“测试命令是 xxx”。
+AGENTS.md 要解决的就是这件事：它是一份写给 AI 的工作空间使用手册。它不替代系统提示，也不替代代码注释，而是把“人希望 Agent 如何在这个目录里工作”写成一份稳定、可版本化、可被反复读取的说明。
 
-这些问题的根源不是模型能力不足，而是缺少一个稳定、机器可读的工作空间约束文件。AGENTS.md 就是 OpenClaw 生态里用来干这件事的：它是一份写给 AI 的操作手册，而不是写给人类看的 README。
+## 问题
 
-## 问题：无约束的 Agent 会带来什么
+没有 AGENTS.md 时，常见现象是：
 
-OpenClaw 支持 MCP、插件和自动化任务，能力越强，越需要边界。一个没有被约束的 Agent 通常会：
+- 每个会话都要重新解释目录结构、命令和禁忌。
+- Agent 把生成物写到错误目录，或者直接修改了不该动的内容。
+- 测试被跳过、提交信息格式随意、MCP 工具被无边界调用。
+- 多 Agent、多插件协作时，各自按自己的理解行事，规则不一致。
 
-- 根据训练数据里的“通用项目习惯”猜测你的工作流，忽略你的特殊约定；
-- 在错误的工作目录执行命令，生成路径错乱的产物；
-- 把自动化任务当作“尽力而为”，不知道该在哪些步骤停下来等人工确认；
-- 面对多个 MCP server 时无从下手，要么全部不调用，要么乱调一通。
+这些问题大多不是模型能力不够，而是工作空间里缺少一份声明式约定。AGENTS.md 就是补上这一层。
 
-这些行为会直接拖慢开发节奏，甚至造成文件覆盖、错误提交、生产环境误操作。与其每次口述规则，不如把规则写进一个文件，让 OpenClaw 每次启动时自动加载。
+## 做法 / 步骤
 
-## 做法：从零开始维护 AGENTS.md
+### 1. 确定文件和加载位置
 
-在仓库根目录创建 `AGENTS.md`，并纳入版本控制。OpenClaw 会在启动工作空间时自动读取该文件，并将其作为系统提示的一部分注入。文件内容建议按以下结构组织：
+项目级文件放在仓库根目录：
 
-### 1. 项目概览
-用 2-3 句话说明这个仓库是什么、主要语言、单体还是 monorepo、部署形态。不要写成长篇大论。
+```text
+AGENTS.md
+```
 
-### 2. 目录约定
-明确哪些目录是源码、哪些是生成物、哪些目录禁止修改。例如：
+用户级默认规则可以放在 OpenClaw 的用户目录下，例如：
 
-- `src/` 为手写源码；
-- `dist/`、`build/` 为构建产物，不要编辑；
-- `.github/workflows/` 为 CI 配置，禁止改动；
-- `packages/shared/types/` 是公共类型，生成代码前先查看。
+```text
+~/.openclaw/AGENTS.md
+```
 
-### 3. 常用命令
-按场景列出命令，并标注允许自动执行还是需要确认：
+项目级规则通常优先级更高。需要确认你的 OpenClaw 版本或插件是否会同时加载两份文件；如果会，要避免规则冲突。
 
-- 开发启动：`pnpm --filter @app/web dev`
-- 单元测试：`pnpm -r test`
-- 构建检查：`pnpm -r build`
-- 部署相关：仅允许 `deploy --dry-run`，真实部署必须人工确认
+### 2. 用固定结构组织内容
 
-### 4. 环境变量与密钥
-告诉 Agent 去哪里找环境变量示例文件（例如 `.env.example`），并明确：**不要把真实密钥写入 AGENTS.md 或代码中**。如果需要传密钥，通过工作空间的 secrets 管理或环境变量注入。
+AGENTS.md 不必像散文，建议模块化。一个可复用的最小结构如下：
 
-### 5. MCP / 插件使用说明
-列出当前可用的 MCP server 和插件，并说明各自用途：
-
-- `filesystem` MCP：可读写 `./workspace`、`./output`，其他目录只读；
-- `playwright` MCP：仅允许访问测试环境域名，禁止访问生产；
-- `github` MCP：只读仓库，禁止创建 PR 或修改 issue。
-
-### 6. 自动化边界
-用“允许 / 禁止 / 需确认”三段式写清：
-
-- 允许：运行测试、格式化代码、创建新文件、读取日志；
-- 禁止：修改 CI 配置、删除文件、 force push、修改依赖锁文件；
-- 需确认：执行数据库迁移、发布构建、合并分支。
-
-### 示例最小模板
+- **Workspace Map**：目录职责和数据流。
+- **Commands**：常用命令、参数、执行顺序。
+- **Guardrails**：禁止事项和必须遵守的边界。
+- **Verification**：如何验证改动正确。
+- **Plugins & MCP**：哪些工具可用，哪些需要确认。
 
 ```markdown
 # AGENTS.md
 
-## Workspace
-- 本仓库为 pnpm monorepo，禁止使用 npm 或 yarn。
-- 源码位于 packages/*/src，公共类型在 packages/shared/types。
+## Workspace Map
+- `src/` 核心源码，禁止直接修改生成物
+- `plugins/` 插件源码，改动需同步更新 `manifest.json`
+- `tests/` 测试文件，与 `src/` 一一对应
 
 ## Commands
-- dev: pnpm --filter @app/web dev
-- test: pnpm -r test
-- build: pnpm -r build
-- deploy: 仅允许 --dry-run
-
-## MCP / Plugins
-- filesystem: 可写 ./workspace 与 ./output
-- playwright: 仅测试环境域名
-- github: 只读
+- 安装依赖：`pnpm install`
+- 跑单测：`pnpm test -- --runInBand`
+- 构建：`pnpm build`
 
 ## Guardrails
-- 不要修改 .github/workflows 下任何文件。
-- 生成代码前先检查 packages/shared/types 是否已有类型定义。
-- 遇到需要真实部署的操作，必须停下来询问。
+- 禁止直接编辑 `.env` 或任何包含密钥的文件
+- 修改 `src/` 前必须先阅读相邻的 `README.md`
+- 调用 `mcp__github` 前必须确认仓库范围
+
+## Verification
+- 功能改动后必须运行 `pnpm test`
+- 插件改动后必须运行 `pnpm build` 并确认无类型错误
 ```
 
-## 踩坑点：这些细节最容易翻车
+### 3. 把规则写成可执行句式
 
-1. **文件过长导致截断或稀释注意力**  
-   OpenClaw 读取 AGENTS.md 有 token 成本。文件太长会被截断，或者重要规则被淹没。建议控制在 300-500 行以内，复杂子项目使用独立的 AGENTS.md 分层放置。
+避免“尽量”“建议”这类含糊表达。Agent 对确定性的指令执行更稳定：
 
-2. **路径写死、反斜杠混用**  
-   Windows 环境下反斜杠容易引起解析问题。建议统一使用正斜杠或相对路径，避免绝对路径写死在文档里。
+- 使用“必须 / 禁止 / 如果……就……”。
+- 每条关键规则最好能附上检查命令。
+- 需要人工确认时，明确写“停止并询问用户”。
 
-3. **把真实密钥写进 AGENTS.md**  
-   AGENTS.md 会被 Agent 读取，也可能被日志记录或分享。**任何情况下都不要写入真实密钥、token、数据库密码**。
+### 4. 纳入版本管理
 
-4. **与 README 混淆**  
-   README 是给人类看的，可以写背景故事、徽章、截图；AGENTS.md 是给 AI 看的，要求短句、命令式、可执行。不要把大段散文复制进来。
+AGENTS.md 应该和代码一起提交。工作空间约定也是工程资产，需要 review，不能只放在本地。
 
-5. **约束过松或过严**  
-   禁止太多，Agent 会频繁停下来提问；禁止太少，Agent 会乱来。用“允许 / 禁止 / 需确认”分区，比单纯堆规则更有效。
+## 踩坑点
 
-6. **更新滞后**  
-   过期的 AGENTS.md 比没有更危险，因为 Agent 会信任它。每次目录结构、命令、环境约定变化时，必须同步更新，最好在 PR checklist 里加一项。
+1. **文件太长导致规则被稀释**：超过 120—150 行后，中段规则容易被 Agent 忽略。长文件应拆分，主文件只放通用规则，模块级规则放到 `module/AGENTS.md` 并由主文件引用。
+
+2. **规则互相冲突**：比如一边写“禁止修改测试”，一边又写“功能改动必须更新测试”。这种冲突会让 Agent 在关键处摇摆。要写清例外条件，例如“只有在需求明确要求时才能修改测试快照”。
+
+3. **路径过期**：目录迁移后 AGENTS.md 未同步，Agent 会按照旧路径操作。建议加一条：“若路径不存在，停止任务并询问用户。”
+
+4. **敏感信息泄露**：不要写 API key、内网地址、密码、Token。AGENTS.md 会被注入上下文，也可能被插件或 MCP 工具读取。
+
+5. **多级文件覆盖与系统提示冲突**：用户级和项目级规则可能冲突；OpenClaw 内置策略也可能限制某些工具权限。AGENTS.md 不能突破 OpenClaw 自身的安全边界，不要在文件里写“忽略所有限制”之类的内容。
+
+6. **只写不维护**：文件一旦过时，比没有更危险，因为 Agent 会把错误信息当成可靠上下文。
 
 ## 可复用建议
 
-- **将 AGENTS.md 纳入项目脚手架**：新项目初始化时自动生成最小版本，避免从零开始。
-- **分层放置**：根目录放全局规则，子目录放局部规则，例如 `frontend/AGENTS.md`，适合大型 monorepo。
-- **用“触发条件”代替描述性规则**：例如“当检测到 Python 文件时，先运行 ruff check”，比“请保持代码风格一致”更可执行。
-- **与 MCP 工具联动**：在 AGENTS.md 中列出每个 MCP server 的预期输入输出，Agent 会更愿意调用合适的工具。
-- **定期让 Agent 自检**：可以写一个一次性 prompt，让 OpenClaw 对比 AGENTS.md 与实际目录结构，输出不一致的 diff 建议，帮助维护。
+- 把 AGENTS.md 当成新成员 onboarding 文档，而不是 prompt 草稿。
+- 用表格描述目录和命令，减少自然语言歧义。
+- 每条规则尽量可验证：附上命令或预期输出。
+- 模块级规则拆分到各自目录，主文件只做索引。
+- 目录结构或命令发生变更时，把 AGENTS.md 作为变更的一部分一起提交。
+- 定期用真实任务测试：让 Agent 只读 AGENTS.md 后复述工作空间规则，检查它是否理解正确。
 
 ## 总结
 
-AGENTS.md 不是银弹，它不能替代代码审查、CI 或团队内部规范。但它是当前成本最低、最可控的 Agent 约束手段。把隐性知识显性化，把每次会话的重复解释变成一次性维护，是每个使用 OpenClaw 的工作空间都应该优先做的事。先写起来，再随着踩坑迭代，比追求一份完美文档更实际。
+AGENTS.md 的价值不在于写得全，而在于写得准、维护得住。它是工作空间里的“地图”和“护栏”，让 Agent 少做错误假设，少问重复问题，也能让多 Agent、插件和 MCP 工具在同一个约定下协作。
+
+对 OpenClaw 用户来说，与其每次都手写长 prompt，不如把稳定规则沉淀到 AGENTS.md 里，让工作空间自己会说话。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/9604fcc715bbc504.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/afe2a2abe3545e3c.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/40ed8ebe1e496b7c.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/233fbe13fe7a6520.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/38b9e5b66fa98e4d.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/243ce1085b56d1f2.png)
 
