@@ -1,85 +1,137 @@
 ---
 title: OpenClaw 的 AGENTS.md：写给 AI 的工作空间使用手册
-feedId: 35489
+feedId: 35509
 source: 综合讨论
 publishedAt: 2026-08-31
 ---
 
-# OpenClaw 的 AGENTS.md：写给 AI 的工作空间使用手册
+## 背景：为什么需要一个给 AI 看的“使用手册”
 
-在 OpenClaw 里，AGENTS.md 不是 README，也不是系统 prompt 的替代品。它更接近一份放在工作空间里的“使用手册”：告诉每次新启动的 agent，这个目录怎么跑、哪些不能碰、工具和 MCP 应该怎么选。
+OpenClaw 作为工作空间智能体，默认情况下每次新会话都像一个刚入职的临时工：它有能力，但不了解你的项目结构、命令习惯、环境边界。你可能遇到过这些情况：
 
-背景是，OpenClaw 工作空间通常不只是聊天，还会挂浏览器插件、文件 MCP、命令行执行和自动化任务。每次任务开始时，agent 如果没有持久上下文，就只能靠短时记忆和试探。常见问题很具体：测试命令猜错、生成目录被手改、MCP 越过工作空间读到家目录、危险命令没人拦。临时纠正一次只解决一次，下一次启动又忘。
+- 在 monorepo 里直接跑根目录 `install`，而不是进入子包；
+- 分不清 dev / staging / prod 环境变量，差点把生产配置改掉；
+- 明明接好了 MCP 和插件，却乱调用工具，或者完全不敢调用；
+- 每次开新会话都要重复解释“这个目录不能动”“测试命令是 xxx”。
 
-AGENTS.md 的价值，就是把这类“工程约定”固化成随项目走、可版本化、可 review 的上下文。建议不要把它写成大而全的文档，而是写成“可执行的护栏”。
+这些问题的根源不是模型能力不足，而是缺少一个稳定、机器可读的工作空间约束文件。AGENTS.md 就是 OpenClaw 生态里用来干这件事的：它是一份写给 AI 的操作手册，而不是写给人类看的 README。
 
-## 做法/步骤
+## 问题：无约束的 Agent 会带来什么
 
-1. 在工作空间根目录新建 `AGENTS.md`。
-2. 先写四块：目录边界、命令入口、工具/插件选择、禁令。
-3. 用短句和列表，不写散文。
+OpenClaw 支持 MCP、插件和自动化任务，能力越强，越需要边界。一个没有被约束的 Agent 通常会：
 
-一个可用的骨架如下：
+- 根据训练数据里的“通用项目习惯”猜测你的工作流，忽略你的特殊约定；
+- 在错误的工作目录执行命令，生成路径错乱的产物；
+- 把自动化任务当作“尽力而为”，不知道该在哪些步骤停下来等人工确认；
+- 面对多个 MCP server 时无从下手，要么全部不调用，要么乱调一通。
+
+这些行为会直接拖慢开发节奏，甚至造成文件覆盖、错误提交、生产环境误操作。与其每次口述规则，不如把规则写进一个文件，让 OpenClaw 每次启动时自动加载。
+
+## 做法：从零开始维护 AGENTS.md
+
+在仓库根目录创建 `AGENTS.md`，并纳入版本控制。OpenClaw 会在启动工作空间时自动读取该文件，并将其作为系统提示的一部分注入。文件内容建议按以下结构组织：
+
+### 1. 项目概览
+用 2-3 句话说明这个仓库是什么、主要语言、单体还是 monorepo、部署形态。不要写成长篇大论。
+
+### 2. 目录约定
+明确哪些目录是源码、哪些是生成物、哪些目录禁止修改。例如：
+
+- `src/` 为手写源码；
+- `dist/`、`build/` 为构建产物，不要编辑；
+- `.github/workflows/` 为 CI 配置，禁止改动；
+- `packages/shared/types/` 是公共类型，生成代码前先查看。
+
+### 3. 常用命令
+按场景列出命令，并标注允许自动执行还是需要确认：
+
+- 开发启动：`pnpm --filter @app/web dev`
+- 单元测试：`pnpm -r test`
+- 构建检查：`pnpm -r build`
+- 部署相关：仅允许 `deploy --dry-run`，真实部署必须人工确认
+
+### 4. 环境变量与密钥
+告诉 Agent 去哪里找环境变量示例文件（例如 `.env.example`），并明确：**不要把真实密钥写入 AGENTS.md 或代码中**。如果需要传密钥，通过工作空间的 secrets 管理或环境变量注入。
+
+### 5. MCP / 插件使用说明
+列出当前可用的 MCP server 和插件，并说明各自用途：
+
+- `filesystem` MCP：可读写 `./workspace`、`./output`，其他目录只读；
+- `playwright` MCP：仅允许访问测试环境域名，禁止访问生产；
+- `github` MCP：只读仓库，禁止创建 PR 或修改 issue。
+
+### 6. 自动化边界
+用“允许 / 禁止 / 需确认”三段式写清：
+
+- 允许：运行测试、格式化代码、创建新文件、读取日志；
+- 禁止：修改 CI 配置、删除文件、 force push、修改依赖锁文件；
+- 需确认：执行数据库迁移、发布构建、合并分支。
+
+### 示例最小模板
 
 ```markdown
 # AGENTS.md
 
-## Workspace map
-- `src/` 运行时代码，`tests/` pytest，`scripts/` 一次性迁移，`docs/` 对外文档
-- 不要修改 `generated/`，该目录由 `pnpm codegen` 生成
-- `.env` 只读，不回写
+## Workspace
+- 本仓库为 pnpm monorepo，禁止使用 npm 或 yarn。
+- 源码位于 packages/*/src，公共类型在 packages/shared/types。
 
 ## Commands
-- install: `pnpm install --frozen-lockfile`
-- test: `pnpm test -- --runInBand`
-- lint: `pnpm lint`
-- 禁止在根目录直接执行 `ts-node`，统一走 `pnpm exec`
+- dev: pnpm --filter @app/web dev
+- test: pnpm -r test
+- build: pnpm -r build
+- deploy: 仅允许 --dry-run
 
-## Tools & plugins
-- 浏览器自动化仅使用 OpenClaw 内置 browser 插件
-- 文件搜索优先 `rg`，不使用 `find`
-- MCP `filesystem` 根目录限定为当前工作空间，不访问 `~/.ssh`、`~/.aws`
+## MCP / Plugins
+- filesystem: 可写 ./workspace 与 ./output
+- playwright: 仅测试环境域名
+- github: 只读
 
 ## Guardrails
-- 禁止执行 `git push --force`
-- 禁止删除 `.cache/`，清理统一走 `pnpm clean`
-- 修改 schema 前先运行 `pnpm db:check`
-- 涉及超过 3 个文件的改动，先给方案，不直接改
+- 不要修改 .github/workflows 下任何文件。
+- 生成代码前先检查 packages/shared/types 是否已有类型定义。
+- 遇到需要真实部署的操作，必须停下来询问。
 ```
 
-写完骨架后，把每次对话中人工纠正过的规则回写进去。比如 agent 错误执行了 `rm -rf .cache`，就补一句“禁止删除 `.cache/`，清理走 `pnpm clean`”。这样 AGENTS.md 会随实际使用逐渐变准。
+## 踩坑点：这些细节最容易翻车
 
-如果项目变大，不要在子目录复制整份 AGENTS.md；根文件保持全局规则，子目录只放局部例外。长任务开始前，可以先让 agent 用一句“我理解的三条关键约束是……”复述，以确认它真的读到了，而不是只在上下文里“见过”。
+1. **文件过长导致截断或稀释注意力**  
+   OpenClaw 读取 AGENTS.md 有 token 成本。文件太长会被截断，或者重要规则被淹没。建议控制在 300-500 行以内，复杂子项目使用独立的 AGENTS.md 分层放置。
 
-## 踩坑点
+2. **路径写死、反斜杠混用**  
+   Windows 环境下反斜杠容易引起解析问题。建议统一使用正斜杠或相对路径，避免绝对路径写死在文档里。
 
-- **太长**：超过 80 行后，模型对中后段约束的遵循度会明显下降。
-- **模糊词**：`尽量`、`建议` 会让 agent 不确定；必须使用“必须/禁止”。
-- **和真实脚本不一致**：AGENTS.md 里的 test 命令要和 CI 对齐，否则 agent 按文件执行，反而破坏 CI。
-- **权限开太大**：文件系统 allow all 后，目录边界基本失效。
-- **写成 README**：应该给命令、路径和边界，而不是写设计感想或模块说明。
-- **只增不删**：过期规则会污染决策，建议每次迭代时清理一次。
+3. **把真实密钥写进 AGENTS.md**  
+   AGENTS.md 会被 Agent 读取，也可能被日志记录或分享。**任何情况下都不要写入真实密钥、token、数据库密码**。
+
+4. **与 README 混淆**  
+   README 是给人类看的，可以写背景故事、徽章、截图；AGENTS.md 是给 AI 看的，要求短句、命令式、可执行。不要把大段散文复制进来。
+
+5. **约束过松或过严**  
+   禁止太多，Agent 会频繁停下来提问；禁止太少，Agent 会乱来。用“允许 / 禁止 / 需确认”分区，比单纯堆规则更有效。
+
+6. **更新滞后**  
+   过期的 AGENTS.md 比没有更危险，因为 Agent 会信任它。每次目录结构、命令、环境约定变化时，必须同步更新，最好在 PR checklist 里加一项。
 
 ## 可复用建议
 
-- 保持 20-40 行；超过 80 行就拆分清理。
-- 命令写完整，例如 `pnpm test -- --runInBand`，不要只写 `pnpm test`。
-- 危险命令用黑名单明确列出：`git push --force`、`rm -rf`、`db reset`。
-- MCP 工具统一加根目录限制，避免跨工作空间访问。
-- 把 AGENTS.md 纳入 PR review，改动规则时像改代码一样说明原因。
-- 多写“事实”，少写“观点”；agent 更容易执行确定性的指令。
+- **将 AGENTS.md 纳入项目脚手架**：新项目初始化时自动生成最小版本，避免从零开始。
+- **分层放置**：根目录放全局规则，子目录放局部规则，例如 `frontend/AGENTS.md`，适合大型 monorepo。
+- **用“触发条件”代替描述性规则**：例如“当检测到 Python 文件时，先运行 ruff check”，比“请保持代码风格一致”更可执行。
+- **与 MCP 工具联动**：在 AGENTS.md 中列出每个 MCP server 的预期输入输出，Agent 会更愿意调用合适的工具。
+- **定期让 Agent 自检**：可以写一个一次性 prompt，让 OpenClaw 对比 AGENTS.md 与实际目录结构，输出不一致的 diff 建议，帮助维护。
 
 ## 总结
 
-AGENTS.md 是 OpenClaw 工作空间里的操作边界和速查表。它不负责提升模型“智力”，但能显著减少 agent 在长链路任务中的错误率和来回解释成本。短、准、可执行，比写得全更重要。
+AGENTS.md 不是银弹，它不能替代代码审查、CI 或团队内部规范。但它是当前成本最低、最可控的 Agent 约束手段。把隐性知识显性化，把每次会话的重复解释变成一次性维护，是每个使用 OpenClaw 的工作空间都应该优先做的事。先写起来，再随着踩坑迭代，比追求一份完美文档更实际。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/4aebf6b8ce2e267f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/9604fcc715bbc504.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/331a1864798bba5e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/40ed8ebe1e496b7c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/dbadbddd24ac8344.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-08-31/38b9e5b66fa98e4d.png)
 
