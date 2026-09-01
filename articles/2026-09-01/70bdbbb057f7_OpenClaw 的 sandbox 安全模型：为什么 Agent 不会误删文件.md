@@ -1,56 +1,62 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 35684
+feedId: 35688
 source: 综合讨论
 publishedAt: 2026-09-01
 ---
 
 ## 背景
 
-OpenClaw 的 agent 默认带 shell、文件读写、浏览器这些工具，等于在宿主机上放了一个会自己敲命令的执行器。很多人的第一反应和我一样：这不就是给桌面放了个能自主决定要不要 `rm -rf` 的东西吗？跑了几个月之后我的结论是：误删这件事，靠的从来不是模型自觉，而是 sandbox 的结构性约束。
+让一个能读会写、还能跑 shell 的 Agent 长期跑在日常机器上，最现实的恐惧只有一个：它哪天"理解偏了"，顺手把某个目录清掉。OpenClaw 给出的回答不是一个更恳切的提示词，而是一套沙箱边界。这篇帖拆一下这套模型的分层逻辑，以及我在自己机器上验证它的过程。
 
-## 问题
+## 问题：边界靠什么保证
 
-LLM 的输出不可预测，所以"它应该不会乱来"不能当安全边界。真正要回答的是两个问题：当模型确实生成了破坏性命令时，系统里有哪几层会拦它？万一全没拦住，损失能不能被限制在很小的范围内并恢复？
+先说一个常见误解：很多人以为安全性来自系统提示词里那句"不要删除文件"。Prompt 是行为偏好，不是安全边界——模型总会犯错，注入总会发生。真正该问的是：当 Agent 执行 `rm -rf` 时，操作系统层面它能碰到什么？OpenClaw 的 sandbox 模型就是围绕这个问题设计的。
 
-## 做法：三层防线
+## 机制拆解：四层边界
 
-**第一层，边界。** 用 Docker sandbox 跑 agent：容器内只挂载 workspace 这一个可写目录，宿主的 HOME 和其他项目目录默认根本不在容器的文件系统里；需要读的配置用只读挂载；容器内跑非 root 用户。此时模型执行 `rm -rf /`，删掉的只是容器层和 workspace，物理上够不到宿主。
+以我当前在用的版本为例（具体配置项名称以你本地版本文档为准）：
 
-**第二层，策略。** tool policy 对 exec 做 allowlist 加审批：常规命令直接放行，`rm`、`sudo`、`dd`、`mkfs` 这类命中危险规则的转人工确认。注意审批要按语义做——拦 `bash -c` / `sh -c` 这类包装器，而不是只匹配 `rm` 前缀，否则一句 `bash -c "rm -rf ..."` 就绕过去了。
+1. **文件工具绑定 workspace**。read/write/edit 这类文件工具默认以 workspace 为根解析路径，`../` 或指向 workspace 外的绝对路径会被直接拒绝。这不是模型"自觉"，是工具层的路径校验。
+2. **exec 落在容器里**。开启 sandbox 后，shell 命令在 Docker 容器内执行，容器只挂载 workspace 目录。宿主机其他目录、其他用户的文件，对容器内进程不可见。命令再野蛮，破坏半径就是那个挂载点。
+3. **会话分级**。主会话（你自己聊天的那个）可配置为非沙箱直跑，方便日常；定时任务、webhook、群聊触发的会话默认走沙箱。风险与触发来源挂钩，这是合理的默认。
+4. **工具白名单**。每个 Agent 可声明允许的工具集合。不给 exec 权限的 Agent，连进入容器的机会都没有。
 
-**第三层，兜底。** workspace 本身是 git 仓库，每轮任务结束自动 commit。前两层都失效时，损失被压在一次提交以内，`git reset` 即可恢复。
+## 验证步骤
 
-验证方式是逃逸演练：故意让 agent 删挂载点之外的路径、读 `/etc/passwd`、写 workspace 外的文件，逐一确认被拒。我第一次演练就抓到了 symlink 穿透。
+别只信文档，信实验，三分钟可以做完：
+
+- 在沙箱会话里让 Agent 执行 `ls /` 和 `ls ~`，确认看到的只是容器内视图；
+- 让它读宿主机路径（比如 `/etc` 下某个文件），确认读不到；
+- 在 workspace 放一个标记文件，让它尝试写到 workspace 外，确认被拒；
+- 最后故意让它 `rm` 一个 workspace 外的路径，看报错信息。
 
 ## 踩坑点
 
-- 图省事把整个 HOME 挂进容器，沙箱等于没做。
-- 容器挂了 docker.sock 或开了 privileged，等于交出宿主 root。
-- workspace 里的软链接指向宿主目录，写操作跟随链接穿出边界；挂载前清理，或对路径做 realpath 校验。
-- exec 审批只做前缀匹配，被 shell 包装器绕过。
-- 备份和 workspace 在同一块盘上，一次 `rm -rf` 一起带走。
-- 多 agent 共用 workspace，A 做清理时把 B 的产出删了；按 agent 分目录。
+- **sandbox 关闭 + exec = 裸奔**。非沙箱时 exec 直接跑在宿主机上，以 gateway 进程所属用户的权限。这是整套模型里最危险的一个开关。
+- **把 home 目录挂进容器**。为了"方便"挂大目录，等于把边界画到了自家门口。挂载永远最小化。
+- **MCP server 不在沙箱里**。MCP 工具进程跑在它被启动的地方，多数就在宿主机。每装一个 MCP server，等于手动执行了一段第三方代码，沙箱不替你背这个锅。
+- **workspace 内的删除不设防**。沙箱防"越界"，不防 workspace 内部的误删。所以 workspace 一定要 git 化或定期快照。
+- **挂了 docker.sock 的容器等于没有容器**，别为了省事把 sock 映射进去。
 
 ## 可复用建议
 
-- 默认拒绝、按需放行；每开放一个能力先问一句"它删了会怎样"。
-- 能只读挂载就不要给写权限。
-- 危险命令审批看语义，不看前缀。
-- workspace 常态化提交，让回滚成本远低于一次误删的心理成本。
-- 每次升级 OpenClaw 或改沙箱配置后重跑一遍逃逸演练——沙箱配置是会腐化的。
+- 任何非本人触发的会话（定时、webhook、群聊）一律强制沙箱；
+- workspace 保持小而独立，`git init` 是底线；
+- 新 MCP server 先在一次性容器里试跑，再接入正式环境；
+- 定期翻 exec 日志，看 Agent 实际跑了什么命令——这是最诚实的审计方式。
 
 ## 总结
 
-Agent 不误删文件，不是因为它"懂事"，而是破坏性操作物理上够不到、策略上过不去、结果上可回滚。三层防线单独看都不算强，叠起来才构成边界。把"模型会不会乱来"这个问题换成"它乱来时会发生什么"，安全设计才算真正落地。
+OpenClaw 防"误删"靠的不是模型听话，而是让危险命令根本没有路径到达你的文件：工具层卡路径，容器层卡视野，会话层卡来源，白名单卡能力。边界是工程问题，不是提示词问题。把每一层当成独立防线逐一验证过，才敢放心让 Agent 长期开机。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/3b8d7d7ef4bdada9.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/c72acc897ee85e82.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/4ea2c5d391703a24.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/270dc4e690310482.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/9d0001baef74059c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/99641f521ea52cde.png)
 
