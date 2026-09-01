@@ -1,89 +1,68 @@
 ---
 title: Agent 与 API 的握手：OpenClaw 怎么对接外部服务
-feedId: 35661
+feedId: 35705
 source: 综合讨论
 publishedAt: 2026-09-01
 ---
 
+# Agent 与 API 的握手：OpenClaw 怎么对接外部服务
+
 ## 背景
 
-Agent 的优势是理解意图、拆步骤、填参数，但真正写入外部系统的动作必须由确定性的 API 调用完成。OpenClaw 场景里，外部服务可以是一个 issue tracker、审批接口、数据库 API 或公司内部网关。对接的核心不是“让模型知道有 API”，而是把模型输出约束到一个可验证、可重试、可审计的执行边界。
+Agent 的价值不在“会聊”，而在“能动手”。OpenClaw 的执行循环本质上是一个工具调用循环：模型决定调什么、传什么参数，框架负责真正发请求、拿结果、回填上下文。所以对接外部服务这件事，直接决定了 Agent 是玩具还是生产力。
+
+OpenClaw 提供三条对接路径：原生 HTTP 工具（tool 定义 + 请求模板）、MCP 接入（外部跑一个 MCP server，暴露 tools 资源）、以及插件（带生命周期和状态的完整扩展）。三条路都能到终点，差别在维护成本。
 
 ## 问题
 
-直接把 REST 调用塞进提示词会有几类问题：
+多数对接失败不是“调不通”，而是调通之后一团糟：
 
-- 凭据暴露、难以轮换；
-- 参数类型和必填项只能靠模型自觉；
-- 超时、限流、非 2xx 没有统一处理；
-- 响应过大时大量 token 被浪费；
-- 排障时看不到请求/响应的结构化日志。
+- 鉴权散落在 prompt、配置、代码三处，轮换密钥要改三个地方；
+- 工具描述写得含糊，模型传参靠猜，一到边界条件就崩；
+- 上游返回 3MB 的 JSON 直接塞进上下文，两轮对话把窗口吃光；
+- 重试逻辑粗暴，一个非幂等的 POST 下单接口被重试三次。
 
-OpenClaw 的工具注册层（HTTP tool / MCP tool）适合承担这层“翻译”。
+本质问题是：把“调 API”当成写一次就完事的脚本，而不是设计一个模型可用的接口。
 
-## 做法
+## 做法与步骤
 
-1. 先定义工具，而不是先写 prompt。给 Agent 的 description 需要说明什么时候用、失败返回什么。参数用 JSON Schema 约束。不同版本 OpenClaw 的工具注册字段可能有差异，以你部署版本为准。
+**第一步：先做 API 尽调。** 确认鉴权方式（API Key / Bearer / OAuth2）、限流策略、分页方式、有没有沙箱环境。这一步花十分钟，能省后面十小时。
 
-```yaml
-tools:
-  - name: create_ticket
-    description: 在工单系统创建一条新工单。仅当用户明确要创建时使用。
-    parameters:
-      type: object
-      required: [title, priority]
-      properties:
-        title: {type: string, minLength: 4, maxLength: 80}
-        priority: {type: string, enum: [low, normal, high]}
-        assignee: {type: string}
-    http:
-      method: POST
-      url: "https://ticket.internal/api/v1/tickets"
-      headers:
-        Authorization: "Bearer ${TICKET_API_TOKEN}"
-        Content-Type: "application/json"
-      timeout_ms: 8000
-      retry:
-        max_attempts: 2
-        backoff_ms: 500
-        retry_on_status: [429, 502, 503]
-```
+**第二步：按场景选路径。** 一次性调用用 HTTP 工具；要在多个 Agent、多个项目复用的能力，封装成 MCP server；需要连接池、订阅 webhook 的，走插件。
 
-2. 凭据只走环境变量或 secret 管理器，不要把 token 写进工具描述或 prompt。
+**第三步：工具 schema 收窄。** 一个工具只做一件事，参数尽量用枚举约束，描述里写清楚“什么时候该用我、什么时候不该”。宁可拆成 `search_order` 和 `get_order_detail` 两个工具，也不要一个万能 `query`。
 
-3. 响应做裁剪。API 返回 100 个字段时，只保留 `id`、`status`、`url`、`error_code` 等关键信息，控制在 2–4 KB 以内，避免后续上下文膨胀。
+**第四步：加一层薄适配器。** 统一处理鉴权注入、超时（建议 10–30s，别让 Agent 挂死）、指数退避重试（只重试幂等操作）、错误归一化——把上游五花八门的报错转成结构化的 `{code, message, hint}`，让模型能“读懂失败原因”并自行纠正。
 
-4. 对复杂接口优先封装 MCP。如果外部系统已有 OpenAPI 3 文档，可以先导入生成工具骨架，再补鉴权和超时策略，不要手写几十个 schema。
-
-5. 给每次调用打上 `tool_call_id`、`status`、`duration_ms`、`masked_headers`，方便回放。
+**第五步：先只读，后写入。** 上线顺序永远是：dry-run → 只读工具放开 → 写操作加确认门（人工审批或二次校验）。
 
 ## 踩坑点
 
-- **200 不代表业务成功。** 很多系统返回 `{"code": 4001}` 和 HTTP 200，必须在 adapter 里检查业务码并转成工具错误。
-- **非幂等 POST 不要盲目自动重试。** 超时重试前至少要求上游支持 idempotency key，或者改用 GET/查询确认。
-- **模型会“编造”枚举值。** `enum` 和 `required` 不能只写在 description，要落在 schema 层。
-- **URL 模板里的变量要做 encode。** `{{repo}}` 可能含 `/`，需要 encodeURIComponent。
-- **SSRF 风险。** 允许 Agent 调用任意 URL 时，必须配置域名白名单/私有 IP 拦截。
-- **报错信息不要原样回灌。** 若上游返回 HTML 或堆栈，需截断并替换成简短 error code。
+1. **重试非幂等接口。** POST 下单重试三次等于三笔订单。重试前先确认幂等性，不支持就传幂等键，或干脆不重试。
+2. **大响应直塞上下文。** 在适配器里做字段裁剪和分页，只回传模型需要的部分。
+3. **密钥进日志。** OpenClaw 的 debug 日志默认全量记录工具入参，外发前务必脱敏。
+4. **描述与实现漂移。** 上游 API 升级后工具描述没更新，模型按旧文档传参。给适配器加 schema 版本断言，不匹配就拒绝调用。
+5. **超时设太长。** 一个卡死的请求会阻塞整个执行循环，30 秒是上限，不是起点。
 
 ## 可复用建议
 
-- 把外部 API 分成只读和写操作。只读 GET 可缓存 10–60 秒并设置 `cache_key`，写操作禁用缓存。
-- 维护一个 `service adapter` 层：统一做鉴权、超时、重试、业务码检查、响应裁剪。Agent 只看到干净的工具。
-- 本地用 mock server 回放固定响应，测试 schema 是否真的能约束模型输出。
-- 每个工具都返回可读的结果对象，而不是裸 JSON：`{ok: true, id: 123, url: ...}` 比把上游 body 整个塞回去稳定得多。
+- 每个外部服务一个独立适配器文件，薄、无状态、可单测；
+- 错误是数据不是异常：返回结构化错误码，让模型参与排障；
+- 默认只读，写入必须过确认门；
+- 记录每次工具调用的耗时、状态码、脱敏后的参数摘要，这是后续优化的唯一依据；
+- 能 MCP 就 MCP，能力沉淀一次，全团队复用。
 
 ## 总结
 
-Agent 与 API 的握手不是“让模型 curl”，而是把不确定性关进参数层，把执行交给确定性的 adapter。OpenClaw 里做好工具描述、schema 约束、鉴权和响应裁剪，外部服务才能真正进入可工程化的 Agent 工作流。接口对了，Agent 才会稳定；日志全了，排障才不靠猜。
+对接外部服务不是“接根网线”，而是给模型设计一套它能正确使用的感官。收窄 schema、加薄适配器、错误结构化、先读后写——这四件事做到位，OpenClaw 的工具调用成功率会有肉眼可见的提升。下次接新服务时，先花十分钟做尽调，比写完再返工划算得多。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/3f860effded44a27.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/42e5b850455d57a2.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/8b0d62a945b07ee0.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/b5aaacdf21264fe0.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/9c60d313f1508d5e.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-01/e13c85f0c5ed9aac.png)
 
