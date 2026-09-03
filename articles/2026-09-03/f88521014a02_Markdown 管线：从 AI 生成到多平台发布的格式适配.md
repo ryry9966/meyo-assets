@@ -1,59 +1,73 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 35896
+feedId: 35969
 source: 综合讨论
 publishedAt: 2026-09-03
 ---
 
 ## 背景
 
-在社区里做内容自动化的同学大多走过类似的路：让 Agent 生成 Markdown，再手动贴到公众号、知乎、博客。写一篇还好，写一个系列就会发现时间全耗在“格式搬运”上——公众号不吃 Markdown，知乎会吞表格，静态站又要 frontmatter。我们的做法是把格式适配从 Agent 手里拿走，做成一条确定性的 Markdown 管线。
+用 Agent 写技术内容已经不稀奇：模型出初稿，人工校对，然后发布。真正麻烦的是发布这一步——同一篇 Markdown，博客要 frontmatter，公众号要转成带内联样式的富文本，掘金/知乎对表格和代码块的支持各不相同，GitHub 上还得保证相对链接不失效。
 
 ## 问题
 
-直接让模型输出各平台格式，有三个明显缺陷：
+两个来源的不确定性叠加：
 
-1. **不可复现**。同一个 prompt 跑两次，内联样式和结构细节都不一样，排版变成抽卡。
-2. **污染内容源**。模型为了适配平台会在正文里塞 HTML，源文件不再是干净的 Markdown，后续没法 lint、没法批量改版。
-3. **平台规则在变**。适配逻辑散落在 prompt 里，规则一改就得重写提示词，而不是改代码。
+1. **AI 输出不稳定**。同样是"写一篇技术帖"，这次从 h1 开始，下次从 h3 开始；代码块语言标签有时给有时不给；偶尔混入内联 HTML 或滥用加粗。靠 prompt 约束只能缓解不能根治——模型是非确定性的，管线必须是确定的。
+2. **平台方言差异**。公众号会剥掉几乎所有的 class 和大部分标签；部分平台不支持 GFM 表格；图片路径（本地相对路径 vs 托管 URL）要求也不同。
+
+结论：不要指望模型"一次生成适配所有平台的内容"，而是让它产出一份规范化 Markdown，格式适配全部交给确定性代码。
 
 ## 做法
 
-核心原则一句话：**Agent 只负责内容，格式转换交给确定性代码**。管线分四层。
+管线拆四段，每段独立可测：
 
-1. **规范层**：约定唯一的 canonical Markdown。frontmatter 固定字段（title/tags/summary/targets），标题从 h1 开始，禁用内联 HTML。跑 markdownlint 卡住不一致的生成物。
-2. **归一化层**：一个清洗脚本处理共性问题——去掉模型爱加的冗余空行和重复强调、外链图片转存图床并重写 URL、mermaid 预渲染成图片。
-3. **适配层**：每个目标平台一个 adapter，在 OpenClaw 侧注册成独立 MCP tool 或 CLI 子命令。公众号走 markdown-it 转 HTML 后用 juice 内联样式；知乎输出降级版 Markdown（宽表格转图片或直接删减）；静态站保留 frontmatter 原样直出。
-4. **校验层**：dry-run 渲染各目标产物存 snapshot，diff 暴露变化。发布前人眼过一遍预览页。
+**1. Normalize（规范化）**
+- heading 层级归一：正文强制从 `##` 开始，不允许跳级
+- 代码块补齐语言标签，缺省就标 `text`，不留空
+- 全角/半角标点、智能引号统一
+- 用 remark 的 AST 处理，不要正则替换 Markdown——正则处理嵌套结构必然出错
 
-Agent 侧只暴露一个统一的 publish 工具，参数就是目标平台列表，降级和转换全部封在工具内部。
+**2. Transform（元数据抽取）**
+- 抽出 title/description/tags 写入 frontmatter，删掉正文里重复的标题行
+- 图片改写为平台要求的绝对 URL
+
+**3. Render（渲染适配）**
+- 每个平台一个 adapter，纯函数：`md → 平台格式`。公众号走 MD → HTML → 内联样式；不支持表格的做 table → 列表降级
+- adapter 之间不共享状态，方便单测
+
+**4. Verify（校验）**
+- 渲染后检查外链可访问、图片非 404、长度不超平台限制
+- 对渲染产物做快照测试，adapter 改动 diff 一眼可见
+
+在 OpenClaw 里可以把这四段封装成一个 skill 或 MCP tool：Agent 只负责产出初始 Markdown 和调用管线，格式细节完全不进 prompt。
 
 ## 踩坑点
 
-- 公众号会剥掉 class 和外部样式表，所有样式必须内联；`<pre><code>` 在 iOS 上会被压行，代码块要限行宽、逐行包 span 上色。
-- 知乎会吞 footnote 和 task list，别指望优雅降级，发布前直接删。
-- 图床防盗链是隐形炸弹：本地预览一切正常，发布后图片全挂。公众号有素材库机制，外链图必须重新上传。
-- frontmatter 忘记剥离，正文开头多一段 YAML，读者一脸问号——校验层就是为这种事存在的。
-- 模型生成的标题层级经常从 h2 开始，一条 lint 规则比在 prompt 里反复叮嘱有效得多。
+- **别在 prompt 里解决格式问题**。试过让模型"输出必须从 h2 开始"，成功率九成，剩下那一成会让下游渲染崩掉。prompt 管内容，代码管格式，边界要清晰。
+- **下划线转义**。`snake_case_name` 在部分渲染器会被吃掉，normalize 阶段统一处理。
+- **frontmatter 泄漏**。某个 adapter 忘了剥，发布出去就是 `---` 开头的尴尬内容。在 render 前统一剥离，别指望每个 adapter 都记得。
+- **图片是重灾区**。相对路径在公众号直接失效；先上传拿 URL 再替换，上传失败要中断而不是留死链。
+- **快照不是银弹**。HTML 快照对空白字符敏感，建议快照 normalize 后的 AST 哈希或关键节点。
 
 ## 可复用建议
 
-- canonical source 只有一份；adapter 只做减法和改写，不做内容增删。
-- 适配逻辑进代码库跟随版本管理，prompt 里只留“输出规范 Markdown”这一条约束。
-- 每个平台 adapter 配一份最小样例文档跑进 CI，平台悄悄改规则时 diff 立刻报警。
-- 新增平台时先写“该平台不支持什么”清单，降级规则从清单推导，不靠猜。
+- 一份 canonical Markdown 作为 single source of truth，所有平台产物都是派生物，可随时重新生成
+- normalize 规则写成 remark 插件，跨项目复用
+- 每条规则配最小 fixture（输入/期望输出），新增规则时跑全量 fixture 防回归
+- adapter 保持无状态、幂等：跑两遍结果必须一致
 
 ## 总结
 
-这条管线没有任何黑科技，价值在于把“格式”从概率性的模型输出里剥离出来：Agent 产出规范的 Markdown，代码负责全部平台差异，校验兜底。改一个平台规则只动一个 adapter，内容源永不搬家。当内容生产从一篇变成一百篇时，这套东西就是你的护城河。
+AI 负责生成内容，管线负责格式确定性，边界划清之后，多平台发布就从"每次手工调格式"变成"跑一遍脚本"。这套分层不限于写作场景：任何"LLM 输出 → 结构化下游消费"的链路，都适用同样的思路。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/0dcc953620e79eb2.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/7d60196fe092886a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/a763febcdd6c88fd.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/dfe6f80e3c1c79c2.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/1907356709325d8f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/973b75929f5a07d6.png)
 
