@@ -1,58 +1,69 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 35978
+feedId: 35990
 source: 综合讨论
 publishedAt: 2026-09-04
 ---
 
 ## 背景
 
-跑 OpenClaw / Agent 时，除了 MCP 暴露的工具，机器上还有大量本地能力：ffmpeg、jq、自研 CLI、内部脚本……模型并不天然知道这些工具的存在和用法。工作区里的 tools.md 就是给 Agent 看的"本地工具手册"：每次会话它都会读，并据此决定调什么、怎么调。
+Agent 能真正执行命令之后，最大的不确定性就从"任务怎么理解"转移到了"环境长什么样"。OpenClaw 的 workspace 里有一组约定文件：AGENTS.md 管行为约束，TOOLS.md 管工具怎么用。但不少人的 tools.md 要么空着，要么写成了工具介绍散文，没发挥它真正的作用——给执行者一份"这台机器的环境事实清单"。
 
 ## 问题
 
-一旦涉及多机环境，tools.md 很快失真：
+没有这份清单时，典型故障长这样：
 
-- 同一个工具，Mac 上在 `/opt/homebrew/bin/`，Linux 服务器在 `/usr/local/bin/`，容器里可能根本没装；
-- 版本不一致导致参数行为不同，Agent 按文档调用却报错；
-- 拿不到准确信息时 Agent 开始"试探"：反复 `which`、`--help`，烧 token 也烧时间；
-- 更糟的是有人把 token、绝对路径直接写进共享的 tools.md，随仓库同步出去。
+- 项目锁定了 pnpm，Agent 按通用经验跑 `npm install`，装出两套 node_modules；
+- 本机只有 `python3`，Agent 反复试 `python`，一个会话烧掉几千 token；
+- 换台机器跑同一个 workspace，端口、路径、MCP server 全对不上，错误集中爆发；
+- 团队环境各异，机器相关约定要么污染仓库配置，要么靠口头传承。
 
-本质：tools.md 被当成了静态文档，而它描述的是一个会漂移的环境。
+本质是环境事实没有单一出处，Agent 只能靠猜，猜错就进入"执行—报错—修正"循环，而且每个会话都要重猜一遍。
 
 ## 做法
 
-1. **分层**：tools.md 只放"稳定事实"——工具用途、调用方式、前置条件、失败表现；机器相关内容放 `tools.local.md`（进 `.gitignore`）或用环境变量间接引用。
-2. **写"可执行"而不是"描述性"**：每条工具给一行可直接复制运行的命令，别写散文。Agent 要的是 invocation，不是介绍。
-3. **用自定位命令**：优先 `uvx` / `pipx` / `npx` / 包装脚本，让路径在运行时解析，而不是写死绝对路径。
-4. **加 smoke test**：每个工具附一条验证命令（如 `ffmpeg -version | head -1`），Agent 调用前先跑，失败即回退，避免在坏环境上叠加错误。
-5. **定期修剪**：文档里的每个工具都应该真实存在。过时条目比没有更危险——模型会优先信文档。
+**1. 分层：base + local。** `tools.md` 提交进仓库，写团队共识："统一 pnpm""测试命令是 `just test`"。`tools.local.md` 加入 .gitignore，写本机事实：绝对路径、端口占用、本地 MCP server 启动方式。在 AGENTS.md 里写明读取顺序：local 覆盖 base。
+
+**2. 只写探测不到的事实。** package.json、Makefile、.env.example 已经是事实来源，不要复读。写 Agent 难以自动发现的：shell 别名、需要先 source 的脚本、代理设置、非标准安装位置。
+
+**3. 每行一条可验证的事实。** 用"键 + 值 + 验证命令"的格式，别写叙事段落：
+
+```
+package_manager: pnpm        # pnpm --version
+python: /usr/bin/python3     # 3.11
+mcp_local: git, sqlite       # 启动脚本见 ~/.config/
+```
+
+**4. 能校验、能再生。** 写个十几行的脚本 dump 环境事实，生成 local 版草稿；再配一个 check 模式逐条跑验证命令，失败即提示环境漂移。新机器初始化 = 跑一次脚本 + 人工补几行。
+
+**5. 控制体积。** 这份文件每次会话都进上下文，给自己定预算：超过 80 行就该删减合并。
 
 ## 踩坑点
 
-- **硬编码密钥**：tools.md 常被同步、备份，任何 credential 都不该出现，用 `$ENV_VAR` 占位；
-- **写太长**：Agent 每次都读，300 行手册会稀释关键信息，控制在能一眼扫完的篇幅；
-- **只写 happy path**：不写超时、权限要求、输出怎么解析，Agent 第一次失败就会自己乱编参数；
-- **多机共用一份**：以为"统一文档"省事，实际是三台机器互相污染假设，出问题还难定位是哪台的环境。
+- **写进敏感信息。** tools.md 会整体进入模型上下文。密钥、token、内网地址只写"去哪找"，不写值本身；local 版即使 gitignore 了也可能被截屏或复制出去。
+- **写成散文。** 三段式"环境介绍"两周必过期，只留事实，不留叙事。
+- **与已有文件重复。** 同一事实出现两处必然漂移，Agent 读到冲突版本比没有更糟。
+- **漏掉 gitignore。** local 版带着内网路径进了仓库，撤都撤不干净。
+- **以为 Agent 会记住。** 会话之间它什么都不会记住，文件就是它的记忆；改了环境不改文件，等于没改。
 
 ## 可复用建议
 
-- **把 tools.md 当代码**：改动手动 review，配一个 lint 脚本 grep 掉 `sk-` 前缀、绝对路径等敏感模式再提交；
-- **模板化**：团队维护一份 `tools.template.md`，新机器只需要填 local 层，十分钟接入；
-- **版本钉死**：文档里写清依赖版本，和 smoke test 一起构成最小验收标准；
-- **全局与项目两级**：通用工具放全局工作区，项目专属工具放项目内，避免一份文件承担所有上下文。
+- base 版变更走 code review：团队约定先改 tools.md，再改人脑子；
+- 校验脚本挂进 shell 初始化或 CI 自检，漂移早暴露；
+- 模板里留一个"已知坑"小节，专收"只在某台机器出现"的怪问题；
+- 这套分层同样适用于 MCP/插件配置：共享清单进 base，个人凭据路径进 local。
 
 ## 总结
 
-tools.md 的价值不在于"写了多少"，而在于 Agent 读完后的第一发命令命中率。把稳定知识与易变环境分层，把描述换成可执行、可验证的命令，再配上定期修剪，它就从一份容易腐烂的笔记，变成环境差异的单一事实来源。这比任何提示词技巧都更省钱、更稳。
+tools.md 解决的不是技术难题，而是事实归属问题：环境事实应该有明确、分层、可校验的出处，而不是散落在各人脑子里等 Agent 每次去猜。搭一个初版只要一个下午，收益是每次会话少烧一轮试错 token。今天就从记录你机器上最容易猜错的三件事开始。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/3ac046ef91eefeb4.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/dbf20c7ffa7accb4.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/da2dcd339ab87276.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/2c49bed082102162.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/ce91a6532dd6f40f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-04/dc1f253c30dcc64c.png)
 
