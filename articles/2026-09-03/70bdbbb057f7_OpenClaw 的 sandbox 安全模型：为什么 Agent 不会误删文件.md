@@ -1,72 +1,69 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 35864
+feedId: 35901
 source: 综合讨论
 publishedAt: 2026-09-03
 ---
 
 ## 背景
 
-OpenClaw 的典型用法是让 Agent 长期驻留，通过 shell / 文件工具直接操作真实工作区：批量重构、清理产物、跑自动化任务。也就是说，Agent 手里天然握着一份「能对文件系统执行写操作」的权限。模型越能干，单次误操作的期望损失就越高。
+让 LLM Agent 直接操作文件系统，最担心的从来不是它写不出代码，而是它“手滑”：一条 `rm -rf`、一次 `git clean`，就可能把没提交的工作全干掉。OpenClaw 在设计上把这个问题当作第一优先级处理，核心思路是：**不信任模型的判断，只信任机制**。模型可以犯错，但机制要保证犯错不等于灾难。
 
-## 问题
+## 问题：一次险情
 
-「Agent 会不会哪天把我 home 目录删了」——这不是段子，可触发路径至少有四类：
+我最早裸跑 Agent 时出过一次险情：让它“清理构建产物”，它自己推理出 `rm -rf build && rm -rf node_modules`，还顺手想删掉一个名字带 `tmp` 的数据目录。那之后我把 OpenClaw 的 sandbox 模型完整梳理了一遍，确认它靠的是四层防线，而不是单点防护。
 
-- **路径幻觉**：模型把 `~/workspace` 解析成 `/workspace`，或拼接出 `../../`；
-- **指令泛化**：「清理一下构建产物」被理解成删除范围过大的 glob；
-- **提示注入**：Agent 拉取的外部 README、网页内容里夹带破坏性命令；
-- **自动化失稳**：定时任务在异常状态下重试，反复执行删除逻辑。
+## 四层防线
 
-要明确一点：靠 system prompt 写「请不要删文件」不构成安全边界。模型偶尔一定会犯错，真正的问题是——错误发生时，爆炸半径有多大。
+**1. 路径边界：workspace 沙箱**
+Agent 的文件工具和 shell 进程都以 workspace root 为边界。所有路径先做规范化（realpath + symlink 解析），再判断是否落在 root 内。软链到 `/etc` 这种逃逸路径会被直接拒绝。
 
-## 做法：纵深防御的四层
+**2. 命令网关：破坏性命令拦截**
+shell 命令不直接执行，先过一层静态审查：匹配 `rm -rf`、`git clean`、`find -delete`、重定向覆盖等模式，命中则拒绝或要求显式确认。别指望正则穷尽所有写法，这一层的作用是“提高作恶成本”，真正的兜底在下面。
 
-OpenClaw 的思路不是「让模型变靠谱」，而是假设它必然犯错，用环境兜底：
-
-1. **沙箱隔离**。工具执行默认落在 Docker 容器里，宿主机只 bind-mount 一个 workspace 目录（读写），其余文件系统对 Agent 不可见。误删的物理上限就是这个目录。
-2. **最小权限**。容器内以非 root 用户运行，按需裁剪 capabilities；网络默认关闭或走白名单，降低注入成功后外联的可行性。
-3. **路径围栏**。文件类工具执行前对路径做 canonicalize，解析符号链接后校验是否仍在 workspace 内，`..` 穿越和软链逃逸直接拒绝。
-4. **破坏性命令闸门**。识别 `rm -rf`、`find -delete`、`mkfs`、批量覆盖写等模式，命中后升级为人工确认，其余正常放行；工具调用全量落审计日志。
-
-配置上大致三步：
+**3. 删除降级：回收站 + 快照**
+即使删除操作漏过了审查，`allow_delete: false` 会让所有删除变成移动到 `.openclaw/trash`，配合会话级快照可回滚。这是我felt最实用的一层：模型以为删了，其实只是搬了个地方。
 
 ```yaml
 sandbox:
-  enabled: true
-  workspace: ~/openclaw-workspace   # 唯一读写挂载
-  network: deny
-  confirm_on_destructive: true
+  root: ~/projects/demo
+  mode: container          # process / container
+  fs:
+    allow_delete: false
+    trash_dir: .openclaw/trash
+  exec:
+    deny_patterns: ["rm -rf", "git clean", "find .* -delete"]
 ```
 
-建议先在一个 scratch 目录里故意下「删掉所有临时文件」的指令，观察围栏和闸门是否真的触发，再接入真实工作区。
+**4. 进程隔离：容器兜底**
+`mode: container` 下整个 Agent 进程（包括它拉起的 MCP server 和插件）跑在容器里，只挂载 workspace，根文件系统只读。前面三层全被打穿，损失也限于挂载目录。
 
-## 踩坑点
+## 踩坑记录
 
-- **挂载粒度错误**：把 `$HOME` 或上级目录挂进容器，围栏形同虚设。workspace 必须是独立的最小目录。
-- **软链陷阱**：workspace 里一个指向 `~/` 的 symlink 就可能造成逃逸，校验必须在 resolve 之后做。
-- **确认疲劳**：闸门阈值太松，用户逢弹窗就点允许，安全闸退化成仪式。宁可收紧模式列表，也别让确认变得廉价。
-- **容器内写丢**：Agent 往容器内层文件系统写文件、没落在挂载卷上，重启后「文件消失」，看起来像误删。检查写路径是否都在挂载点内。
-- **定时任务旁路**：cron 直接调宿主机脚本，绕过了沙箱。所有自动化入口都应走同一套沙箱配置。
+- **symlink 逃逸**：只在字符串层面判断路径前缀没用，必须 realpath 之后再校验，否则 workspace 里一个软链就能绕出去。
+- **子 shell 绕过**：`sh -c "cd / && rm ..."` 能骗过简单模式匹配，所以容器隔离不能省。
+- **MCP 是 blind spot**：MCP server 如果自带文件访问能力且跑在沙箱外，等于给模型开了后门。所有 MCP 进程必须和 Agent 同沙箱。
+- **太严会误伤**：构建工具要写 `/tmp`，全禁会天天失败。按白名单放行临时目录，而不是放行一切。
+- **git clean 是重灾区**：它长得不像“删文件”，模型很爱用，模式匹配务必覆盖。
 
 ## 可复用建议
 
-- 把「爆炸半径」当设计指标：任何新工具接入前先回答一句，它最坏能影响哪些路径。
-- 批量操作前让 Agent 先打 git commit。回滚比拦截更可靠，两者都要有。
-- 审计日志定期人工抽检，比事后追责有用得多。
-- 用对抗性 prompt 定期演练沙箱。配置漂移比漏洞更常见。
+1. 默认拒绝，按需放行；权限粒度到“读 / 写 / 删”三级。
+2. 删除一律降级为回收站，真删交给人类。
+3. 每次写删操作落审计日志，出事能倒放。
+4. 定期做破坏性演练：故意让 Agent 执行危险命令，验证四层防线都还生效——沙箱配置改了没人测，等于没有。
 
 ## 总结
 
-Agent 不误删文件，从来不是因为模型足够聪明，而是因为环境让它删不到。OpenClaw sandbox 的价值在于把「模型会犯错」当成默认假设：隔离限定损失上限，围栏和闸门抬高犯错成本，git 和审计提供兜底。Prompt 可以引导行为，但只有环境约束才是真正的安全边界。
+Agent“不会误删文件”不是因为模型聪明，而是因为架构上让误删变得困难、可拦截、可回滚。路径边界管住位置，命令网关管住手段，删除降级管住后果，进程隔离管住最坏情况。四层里任何一层单独存在都不够，叠起来才敢放心让它干活。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/9805f3fc17c017de.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/cf35167a82f8d38b.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/8301600be89ded3e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/a303b3990f95e86b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/bff17fef66e24e2d.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-03/fbb66741ae1c3038.png)
 
