@@ -1,72 +1,67 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 36133
+feedId: 36136
 source: 综合讨论
 publishedAt: 2026-09-05
 ---
 
 ## 背景
 
-大多数 Agent 框架把"人格"写死在 system prompt 或代码常量里：名字、语气、口头禅混在几百行的提示词中间。OpenClaw 的做法是把身份单独抽成一个 Markdown 文件——`IDENTITY.md`，默认放在 `~/.openclaw/workspace/` 下，每次会话启动时自动注入上下文。身份不再是代码，而是数据。
+在 OpenClaw 里，agent 的行为不完全是代码决定的。每次会话启动时，workspace 下的一组 markdown 文件会被注入上下文，`IDENTITY.md` 是其中最“人格化”的一份：它定义这个 agent 是谁、叫什么、用什么口吻说话。它不是藏在黑盒里的 system prompt，而是你手里的一个普通文件——可以 git 管理、可以 diff、可以回滚。这意味着“agent 是谁”这件事，可以按工程化的方式演进。
 
 ## 问题
 
-实际用下来，没有这个文件时会遇到三类麻烦：
+不维护身份文件时，常见三个痛点：
 
-1. **散落**：称呼、语气、行为约定分散在多个 prompt 片段里，改一次要全局搜索，漏一处就不一致。
-2. **漂移**：Agent 跑久了，跨会话的"自我认知"不稳定，今天自称助手、明天自称伙伴。
-3. **用户偏好无处安放**：怎么称呼你、你习惯什么语气，这类信息反复在对话里重申。
+- **行为漂移**：没有固定身份，agent 的口吻和边界每次会话都不一样，今天克制明天话痨。
+- **调教成果丢失**：你在对话里纠正过十次“别滥用 emoji”，换个新会话又原样复发。
+- **不可审计**：设定散落在提示词里，没法 review，改坏了也不知道改了什么。
 
 ## 做法
 
-最小可用版本就四个字段，几十字节就够：
+1. **放对位置**：workspace 根目录建 `IDENTITY.md`。
+2. **写该写的**：名字、角色定位、语气基线、语言偏好（如“默认中文，术语保留英文”）、边界（如“不确定就说不确定，不要编”）。
+3. **保持短**：每个会话都消耗 token，建议控制在 30–60 行，一屏以内。
+4. **git 管理**：agent 表现不符预期、你手工纠正后，把结论沉淀成一条规则，commit 进去，附一句变更原因。
+5. **小步迭代**：观察两三个会话再改下一版，一次别动太多，否则无法归因。
+
+一个最小骨架：
 
 ```markdown
-# IDENTITY.md
-
-- **Name:** 小爪
-- **Emoji:** 🦞
-- **Vibe:** 务实、简洁、不废话，技术问题直给方案
-- **Notes:** 中文优先；不确定的事明说不确定，不编造
-
-## 自我描述
-一个常驻本地的工程师助手，擅长自动化与插件实践。
+# Identity
+- Name: 
+- Role: 
+- Tone: 
+- Language: 
+- Boundaries: 
 ```
-
-维护它有三种方式：
-
-1. **直接编辑**：改完即时生效，下个会话就注入新内容。
-2. **让 Agent 自己改**：直接说"更新你的 IDENTITY.md，加上 XX 约定"。OpenClaw 的 agent 有 workspace 写权限，改完会自己留版本记录。
-3. **周期性反思**：配合 heartbeat 定时任务，让 agent 基于近期对话和 MEMORY.md 总结出"稳定结论"，写回身份文件。
-
-注意分工，别把所有东西塞进一个文件：`IDENTITY.md` 管"我是谁"，`USER.md` 管"用户是谁"（称呼、偏好），`SOUL.md` 管行为边界和价值观，`MEMORY.md` 管事实记忆。身份文件只放前者。
 
 ## 踩坑点
 
-- **写太长**。IDENTITY.md 每次会话都注入，写成长文会稀释重点、浪费 token。经验是控制在 200 字以内。
-- **混入任务指令**。"每天早上发日报"这类内容属于 AGENTS.md 或定时任务，写进身份文件会导致职责混乱。
-- **放任自由改写**。让 agent 随意进化身份，几周后人格可能完全变样。建议在 SOUL.md 里加一条"身份变更需用户确认"，或者干脆用 git 管 workspace，每次改动有 diff 可查。
-- **删掉 Emoji/Creature 这类"玩具字段"**。它们看着像装饰，实际是模型的自我锚定点，删掉后回复风格常有可感知的变化，不建议精简过头。
-- **多 Agent 场景**忘了 workspace 隔离，导致两个 agent 共用一份身份。
+- **写成小作文**：身份文件不是简历。越长关键指令权重越稀释，“不要编造”这种硬边界会被淹没在一堆形容词里。
+- **职责混装**：“我是谁”（IDENTITY.md）、“用户是谁”（USER.md）、“行为准则”（SOUL.md）分开放。把某个用户的偏好写进身份文件，换个使用者就废了。
+- **和系统提示打架**：system prompt 和 workspace 文件同时改口吻，agent 会来回横跳。先确认层级，迭代只在 workspace 层做。
+- **期望热生效**：改动通常在下一个会话生效，长会话和缓存的场景不会自动加载，验证前先开新会话。
+- **整份抄别人的**：覆盖一份现成的 IDENTITY.md，得到的是别人的 agent。这个文件的价值在迭代历史，不在初版。
 
 ## 可复用建议
 
-- workspace 进 git，身份演进就有了完整的版本历史，出问题可回滚。
-- 字段模板从 Name / Emoji / Vibe / Notes 四项起步，用出需求再加。
-- 每月做一次"身份审计"：让 agent 自我总结当前状态，人工审核后合入，避免无人监督的渐进漂移。
-- 团队内可以沉淀一份统一的 IDENTITY.md 模板，保证多个部署实例的行为基线一致。
+- 把它当 config-as-code：有 changelog、有 review、能回滚。
+- 每个迭代周期做一次“蒸馏”：翻聊天记录，把重复纠正超过两次的点写进文件——这是身份进化最可靠的来源。
+- 多 agent 场景下，每个 agent 独立 workspace、独立身份文件；共性部分（如安全边界）抽成共享片段分别引用。
+- 用 diff 而不是重写：小步修改，才能定位是哪一条规则引起了行为变化。
 
 ## 总结
 
-IDENTITY.md 的价值不在文件本身，而在于它把"身份"从代码常量变成了可版本化、可审计、可让 Agent 参与维护的状态。工程上看，这就是把配置外部化这个老思路，用在了 Agent 自我认知上——简单，但确实解决了长期运行下的一致性问题。建议每个跑 OpenClaw 的实例都认真写一份，哪怕只有五行。
+IDENTITY.md 的核心价值不是“调教出一个好人格”，而是把“agent 是谁”从隐性的提示词，变成显性、可版本化、可进化的资产。它很小，但它是你所有调教工作的沉淀层。建议今天就 `git init`，给身份一个历史。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/5816ec5b8564caa2.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/4bc65d83dc2ae7f9.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/d9dfffbaa2702dda.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/ecf23e3f2bb71ff4.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/97fe6ae29a08e64a.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-05/c29c08cff7140e78.png)
 
