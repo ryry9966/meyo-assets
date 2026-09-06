@@ -1,54 +1,71 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 36312
+feedId: 36348
 source: 综合讨论
 publishedAt: 2026-09-06
 ---
 
 ## 背景
 
-OpenClaw 的 Agent 可以执行 shell 命令、读写文件、调用 MCP 工具。能力越大，风险越直接：一次错误的 `rm -rf` 就可能清空工作目录。社区里最常被问的问题之一就是——“让 Agent 自己跑命令，真的安全吗？”这篇帖拆解 OpenClaw 的 sandbox 模型，说明误删文件这类事故为什么在正确配置下很难发生。
+给 Agent 接上 shell 和文件工具之后，第一件让人睡不着觉的事就是误删。OpenClaw 的设计前提是：模型能力越强，越不能靠"提示词求它小心一点"来兜底。所以 sandbox 不是可选插件，而是执行链路的默认组成部分。
 
-## 问题本质
+## 问题：误删到底怎么发生的
 
-“模型不可靠”是前提，不是 bug。任何依赖“Agent 永远不犯蠢”的安全设计都是脆弱的。OpenClaw 的思路是反过来的：假设 Agent 迟早会执行错误命令，然后用系统层限制把爆炸半径压到最小——纵深防御，而不是单点拦截。
+复盘真实事故，误删几乎都不是模型"想删"，而是三类因素叠加：
 
-## 做法：四道防线
+1. **路径理解偏差**：相对路径、工作目录漂移、`~` 展开，agent 心里的目录和真实目录不一致；
+2. **工具权限过大**：一个能跑任意 Bash 的会话，等价于把整台机器交给概率；
+3. **缺少不可逆闸门**：rm、git clean、覆盖写没有第二道确认。
 
-**1. 文件系统白名单挂载。** sandbox 模式下，exec 和文件工具跑在容器里，宿主机只有显式 bind-mount 的 workspace 目录对它可见，读写权限分开声明。`~/.ssh`、`~/.aws`、系统目录默认根本不在沙箱视野内——Agent 想删也“看不见”。
+## 做法：三层模型
 
-**2. 非 root 运行 + 命令策略。** 容器内进程以普通用户运行，对未挂载路径没有写权限。exec 工具另有一层 pattern 策略：`rm -rf /`、`mkfs`、`dd of=/dev/*` 这类高危模式直接 deny，不依赖模型自觉。
+OpenClaw 的 sandbox 分三层，可以只开第一层，但生产建议全开。
 
-**3. 高危操作人工审批。** 没被 deny 但属于破坏性的命令（删除、递归 chmod、覆盖写），可配置 approval 流程：命令先暂停，网关推送确认后才放行。MCP 写类工具同理，可单独设置 require-approval。
+**第一层：文件系统 jail。** 默认只把 workspace 以 bind mount 挂进沙箱，其余路径对进程不可见——不是"不让写"，是根本看不见。
 
-**4. 快照与回收站兜底。** workspace 在破坏性操作前自动打快照；文件删除默认移入 `.trash`，延迟真正清理。即使前三层全部失效，损失也限于一个可回滚的目录。
+```yaml
+sandbox:
+  mounts:
+    - host: ./workspace
+      guest: /workspace
+      mode: rw
+    - host: ~/.cache/pip
+      guest: /root/.cache/pip
+      mode: ro
+```
+
+**第二层：能力声明。** 每个 MCP 工具、插件注册时声明 capability（fs.write、fs.delete、net.exec 等），策略层按会话放行。工具没声明 fs.delete，就不会出现在 agent 的工具列表里——不是拦截报错，是压根不知道有这功能。
+
+**第三层：破坏性命令闸门。** 命中规则（rm -rf、`>` 覆盖、git clean）的调用先走 dry-run：OpenClaw 先算出"会删什么"的 diff，超范围直接拒绝，范围内且开启 confirm 才放行。
+
+验证方法：部署后故意构造一条"把 ~/.ssh 清理一下"的测试指令，预期结果是 agent 在沙箱内找不到该路径并如实报告，而不是静默失败。
 
 ## 踩坑点
 
-- 图省事把整个 `$HOME` 挂进沙箱，白名单退化成黑名单，隔离形同虚设。
-- 挂载目录内的符号链接指向宿主机其他路径，构成逃逸通道；挂载前用 `realpath` 校验目录真实位置。
-- 把 `docker.sock` 挂进沙箱“方便构建”，等于把宿主机 root 交出去。
-- 觉得审批烦，全量关掉 approval，然后 Agent 一次“清理缓存”扫光构建产物。审批是高危命令的闸门，最多降级，不要关闭。
-- 容器内跑 root：即使有挂载限制，权限放大依然危险，确认 user 映射真的生效。
+- 挂了整个 `$HOME` 图省事，等于 jail 白设，坚持挂最小集合；
+- 把 Docker socket 挂进沙箱：agent 通过 `docker run -v` 反手把宿主机全挂进来，jail 形同虚设；
+- Bash 兜底绕过：文件工具被拦，agent 改用 python 写文件。沙箱必须作用在进程层（文件系统视图），而不是工具层的关键字过滤；
+- symlink 逃逸：workspace 里早先留下的软链接指向外部，bind mount 不主动拦，启用 resolve+deny 策略；
+- 第三方 MCP 工具常默认申请过宽 capability，每装一个新插件都要重新过一遍策略。
 
 ## 可复用建议
 
-1. 永远用白名单挂载，一个项目一个 workspace，不共享。
-2. 破坏性操作遵循“先移动后删除”，trash 定期清理而非实时清空。
-3. 保留审批与 exec 日志，事后能回答“谁在什么时候执行了什么”。
-4. 做一次演练：在测试环境故意让 Agent 跑 `rm -rf`，验证 deny 规则、审批链路、快照回滚是否真实生效。没演练过的安全配置等于没配置。
+1. 只读是默认，写是例外；
+2. 删除类操作永远过 diff 闸门，代价是几百毫秒，收益是不可逆操作全程有审计记录；
+3. 每次升级插件跑一遍"越狱测试集"，当作回归测试的一部分；
+4. 审计日志里保留 dry-run 的 diff，事后才能回答"它当时到底想删什么"。
 
 ## 总结
 
-Agent 不会误删文件，不是因为模型聪明，而是因为架构假定它会犯蠢。OpenClaw 的 sandbox 模型用“白名单挂载 + 非 root + 命令策略 + 审批 + 快照”把单次错误的代价压到可回滚的范围内。安全配置的目标从来不是阻止 Agent 做事，而是让失败变得便宜。
+"Agent 不会误删文件"不是模型听话，而是架构上让误删不可表达：看不见的路径删不了，没声明的工具调不到，声明过的删除必须先出示清单。信任来自边界，不来自祈祷。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/88f6b045333d617f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/65edf0b528353918.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/5cdaee007309f3cf.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/b23cc4aff5946da5.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/1c3593e12c05fc43.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-06/5458045efc7641cc.png)
 
