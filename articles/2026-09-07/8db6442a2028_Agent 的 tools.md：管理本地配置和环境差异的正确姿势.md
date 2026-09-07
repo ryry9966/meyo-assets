@@ -1,67 +1,81 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 36382
+feedId: 36420
 source: 综合讨论
 publishedAt: 2026-09-07
 ---
 
 ## 背景
 
-跑 Agent 做自动化，最烦的往往不是模型能力，而是每台机器都不一样。同样是 macOS，一台的 ffmpeg 是 Homebrew 装的，另一台是手动编译在 `/usr/local/bin`；Linux 上一台有 `npx`，一台只有裸 `node`；容器里连 `git` 都可能缺席。Agent 每次动手前都要"猜"环境，猜错就报错、重试、烧 token。
+OpenClaw 的 Agent 一旦开始真正干活，就绕不开本地环境：ffmpeg 装在哪、Python 用哪个 venv、浏览器驱动什么版本、MCP server 的启动参数是什么。这些信息如果只存在于你的脑子和某次调试用的 prompt 里，换台机器 agent 就会开始猜——猜错的结果就是幻觉路径、瞎执行、浪费 token。
 
-tools.md 就是写给 Agent 看的"本地环境说明书"：把工具的位置、版本、调用约定、缺位时的降级方案写清楚，让 Agent 少猜、多查、按事实执行。
+我们的做法是把"工具清单"固化成一份 agent 可读的 `tools.md`，让它成为环境事实的唯一入口。
 
 ## 问题
 
-常见的三种失败模式：
+常见的几种翻车方式：
 
-1. **硬编码路径**。`/opt/homebrew/bin/ffmpeg` 在 A 机可用，B 机直接 `no such file`。
-2. **配置漂移**。升级工具后忘了更新说明，Agent 按旧版本参数调用，行为诡异还难排查。
-3. **一机一档**。每台机器单独维护一份，几周后没人记得哪份是准的。
+- 绝对路径写死在 skill 或系统 prompt 里，换机器/换容器直接失效；
+- 同事的工具在 `/opt`，你的是 Homebrew，agent 按 A 机器的描述去调 B 机器；
+- 为省事把 API key 顺手写进配置然后提交了仓库；
+- MCP 配置和 prompt 里的工具描述各自演化，慢慢对不上；
+- Windows 路径带空格或中文、agent 拉起的 shell 和你交互 shell 的 PATH 不一致。
 
-## 做法
+本质是同一个：**环境事实没有分层，也没有校验。**
 
-我的结构是"意图 + 事实"两层：
+## 做法与步骤
+
+**1. 分层：base + local。**
+
+- `tools.md`：提交进仓库，只写与机器无关的事实——工具是干什么的、大致怎么调用、前置条件；
+- `tools.local.md`：进 `.gitignore`，只放本机覆盖项——绝对路径、版本、特有参数；
+- 机密永远不落在这两个文件里，用环境变量，tools.md 里只写变量名。
 
 ```markdown
-# tools.md（意图层，随代码提交）
-## 工具清单
-- video-convert: 视频转码。调用 `ffmpeg`，
-  校验方式：`command -v ffmpeg && ffmpeg -version`。
-  缺失时：提示用户安装，不要自行猜测路径。
+# tools.md（base 层）
+transcode:
+  what: 音视频转码
+  cmd: ${FFMPEG_BIN:-ffmpeg}
+  check: ffmpeg -version
+
+# tools.local.md（本机覆盖）
+transcode:
+  cmd: /opt/homebrew/bin/ffmpeg
 ```
 
-关键点四个：
+**2. 明确加载顺序。** 环境变量 > tools.local.md > tools.md，后者只补前者未定义的键。不做深合并，一层覆盖一层，行为可预测。
 
-1. **意图写死，事实生成**。工具用途、调用约定、降级策略是稳定的，人写；实际路径和版本易变，由一个 `probe.sh` 探测后生成 `local-facts.md`（事实层），tools.md 开头明确写一句："执行任何工具前，先读本文件和 local-facts.md"。意图层进 Git，事实层被忽略、随时可重建。
-2. **校验命令优先于路径**。能用 `command -v` 确认存在的，就不写绝对路径。Agent 先跑校验再执行，路径只作参考。
-3. **缺失策略必须显式**。每个工具写清"没有怎么办"：跳过、降级到备选工具，还是停下来问人。这比让 Agent 现场发挥可靠得多。
-4. **接入系统提示**。在 AGENTS.md 或系统提示里加一条读取规则，tools.md 写得再好，Agent 不读也白搭。
+**3. 启动时校验，而不是祈祷。** 写一个十几行的 `doctor` 脚本：读合并结果，逐条执行 `check`，失败就打印哪台机器缺什么。会话启动前跑一次，失败直接退出。
+
+**4. 把"不要猜"写进 tools.md 本身。** 第一行就告诉 agent：任何工具未通过校验时，报告缺失，禁止凭记忆编造路径。这句话比后面所有条目都值钱。
+
+**5. 和 MCP 配置划清边界。** tools.md 描述语义（什么时候用哪个工具），MCP 配置持有连接参数。tools.md 里只放指向关系，不复制内容，避免两份真相漂移。
 
 ## 踩坑点
 
-- **别把密钥写进 tools.md**。这个文件会整体进入 Agent 上下文，等于把 secret 喂给模型和日志。只写变量名和获取方式，比如"从系统钥匙串读取 `OPENCLAW_API_KEY`"。
-- **别写成百科全书**。每一段都在吃 token。只写 Agent 会用到的工具和真实存在的差异点，用不上的删掉。
-- **探测脚本要幂等且快**。probe 每次会话跑一次就够，别在每次工具调用前都探测，否则开销比收益大。
-- **升级工具后先跑 probe 再派任务**。旧的事实层比没有更危险——因为它看起来可信。
+- **写成散文。** tools.md 每个会话都进上下文，长篇大论纯烧 token。条目化，一句 what、一句 how，够了。
+- **校验只存在于文档里。** "理论上能跑"等于不能跑，`check` 必须在启动时真的执行。
+- **编辑后不生效。** 有的运行时会缓存工具清单，改完记得重启会话或触发 reload。
+- **覆盖层级太多。** 最多两层，再叠 env-specific、user-specific 就没人说得清最终值从哪来。
+- **子进程 PATH 与交互 shell 不一致。** 关键工具在 tools.local.md 写绝对路径，别赌 PATH。
 
 ## 可复用建议
 
-- 新工具接入三行起步：用途、校验命令、缺失策略，之后按实际踩坑补充，不预写。
-- 把 `probe.sh` 和 tools.md 模板放进脚手架仓库，新机器 `git clone` 加一条命令完成初始化，避免"一机一档"。
-- 事实层用机器可解析的 `key: value` 格式，别写成散文，方便 Agent 精确匹配而不是靠语义理解。
+- 新机器初始化固化成一条命令：跑 doctor → 自动生成 tools.local.md 骨架 → 人工填空；
+- tools.md 的改动走 PR，把它当代码而不是便签；
+- schema 保持稳定（what / cmd / check 三件套），agent 对结构的记忆比对散文可靠得多。
 
 ## 总结
 
-tools.md 的本质，是把"环境差异"从运行时的意外，变成启动时的已知输入：意图管稳定，事实管差异，脚本管同步，人只管审批和密钥。这套做法不炫技，但效果实在——按我自己的记录，改造后单任务平均重试次数从 2.3 降到 0.6，且大部分报错从"环境问题"变成了真正需要人判断的问题。如果你的 Agent 也常在不同机器间搬运任务，值得花半小时把这套结构搭起来。
+tools.md 不是高深机制，就是三件事：**分层（base + local）、校验（启动时 doctor）、不重复（MCP 归 MCP）**。做完之后最直观的变化：换机器从半天调试变成填五分钟空，agent 从"偶尔猜路径"变成"缺了就报告"。工程上便宜，收益上稳定，值得成为团队默认约定。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/60c7a56bcfb5c5b2.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/cb5afc2713403c9f.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/799530b61eccb409.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/05ce9d57af415c60.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/f6cfbe7f91eaf7c5.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/421d0c6ee394a757.png)
 
