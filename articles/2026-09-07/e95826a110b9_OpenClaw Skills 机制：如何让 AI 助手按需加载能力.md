@@ -1,64 +1,76 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 36407
+feedId: 36429
 source: 综合讨论
 publishedAt: 2026-09-07
 ---
 
-## 背景：上下文是稀缺资源
+## 背景
 
-跑 Agent 时间长了都会遇到同一个问题：能力越加越多，提示词越来越长。早期我的做法很粗暴——把所有工具说明、操作规范、API 约定全塞进 system prompt。三五个工具时还行，等堆到几十项，上下文直接膨胀，模型的注意力被无关内容稀释，该遵守的规范反而执行不到位。
+给 Agent 加能力，最常见的做法是往系统提示词里堆：工具说明、操作规范、领域知识全塞进去。能力少的时候没问题，一旦超过十几项，上下文被占满，模型注意力被稀释，选错工具的概率明显上升，token 成本也跟着涨。
 
-OpenClaw 的 Skills 机制就是针对这个问题的解法，核心思路是**渐进式披露（progressive disclosure）**：不把能力全量注入，而是按需加载。
+OpenClaw 的 Skills 机制针对的就是这个问题：能力以"技能"为单位拆成独立文件夹，平时只有一行元数据（名称 + 描述）驻留上下文，完整内容在模型判断相关时才注入。也就是所谓的渐进式披露——元数据常驻做路由，正文按需，细节文件再按需。
 
-## 机制拆解：三层加载结构
+## 做法
 
-Skills 的加载分三层：
+一个技能的最小结构：
 
-1. **启动时**：只把每个 skill 的 `name` 和 `description`（元数据）注入上下文，单个 skill 只占几十个 token；
-2. **触发时**：模型判断当前任务与某个 skill 相关，才去读完整的 `SKILL.md` 正文；
-3. **深入时**：正文里引用的 `references/*.md` 细节文档、`scripts/` 下的脚本，只在真正需要时才被读取或执行。
+```
+skills/
+  pdf-report/
+    SKILL.md
+    scripts/render.py
+```
 
-也就是说，你装了三十个 skill，常驻上下文的可能只有一两千 token。
+`SKILL.md` 分 frontmatter 和正文两部分：
 
-## 做法：写一个能被正确触发的 Skill
+```markdown
+---
+name: pdf-report
+description: 生成月度 PDF 报表时使用。触发词：报表、周报、PDF 导出。
+---
 
-以我最近写的「周报生成」skill 为例：
+## 步骤
+1. 确认数据源路径；
+2. 调用 scripts/render.py，不要自己重写渲染逻辑；
+3. 输出到 ./output/ 并附校验和。
+```
 
-1. 在 `~/.openclaw/skills/` 下建目录，比如 `weekly-report/`；
-2. 写 `SKILL.md`，frontmatter 里 `name` 用短横线小写，`description` 最关键——它是模型路由的依据；
-3. 正文按固定结构写：**何时使用、前置条件、操作步骤、约束与边界**；
-4. 详细格式规范拆到 `references/format.md`，可复用的统计脚本放 `scripts/count.py`；
-5. 重启会话后验证加载链路。
+几个关键点：
 
-description 我最终写成："Use when the user asks to generate a weekly report, summarize git commits of the current week, or mentions 周报."——明确触发条件，而不是"用于生成周报"这种模糊描述。
+- **description 是路由信号。** 模型靠这一行决定要不要加载技能，必须写清"什么时候用"，把典型触发词放进去。
+- **正文控制在两百行以内。** 长配置、字段说明拆成 reference 文件，正文里只留路径，模型需要时再读，触发一次不至于注入几千 token。
+- **确定性操作写成脚本**放进技能目录，让模型调用而不是每次现写代码，输出更稳定也省 token。
+- **放置位置**：全局技能放 `~/.openclaw/skills`，工作区技能放工作区的 `skills/` 目录，后者优先级更高，适合放项目相关能力。
+
+验证方法：开一个新会话，用描述里的触发词提问，再看网关日志确认技能是否被注入。没触发就回头改 description。
 
 ## 踩坑点
 
-- **description 写得像目录名**：模型永远不会触发。它是给模型看的路由信号，不是给人看的简介；
-- **把所有内容塞进 SKILL.md 正文**：等于换了个地方污染上下文，渐进式披露就失效了，细节务必外置；
-- **以为脚本会自动执行**：skill 里的脚本仍是模型通过 exec/bash 工具调用的，路径建议写绝对路径，或在正文里写明工作目录；
-- **与内置 skill 重名**：会出现覆盖或触发混乱，命名前加自己的前缀更稳妥；
-- **改完不重启**：测试跑的永远是旧版本，白调半天。
+1. description 写得太泛（比如"帮助用户处理文件"）会到处抢触发，太窄则永远不命中。用"场景 + 触发词"的格式最稳。
+2. 把所有内容塞进 SKILL.md 正文，渐进式披露就白做了——细节一定要外置。
+3. 脚本里写死绝对路径或依赖没装，技能换个机器直接失效。脚本开头加环境检查。
+4. 技能名和内置技能重名会被覆盖，建议给自己的技能加统一前缀。
+5. 别指望技能"常驻生效"。技能按意图触发，需要每轮都遵守的规则（语气、安全约束）应该写进 AGENTS.md，而不是做成技能。
 
 ## 可复用建议
 
-- description 一律从模型视角写触发条件，句式用 "Use when..."；
-- `SKILL.md` 正文控制在几百行内，展开内容一律走 `references/`；
-- skills 目录纳入 git 管理，改动可回溯、可共享给团队；
-- 排查触发问题时，让模型复述它实际读了哪些文件，快速定位断在哪一层。
+- 一个技能只做一件事，宁可拆成多个。
+- 沉淀团队模板：frontmatter + 步骤 + 边界条件 + 脚本，格式统一才好维护。
+- 技能目录进 git，跨机器同步，改动能走 review。
+- 把自己重复贴过三次以上的 prompt 片段升级成技能，这是最实际的收益来源。
 
 ## 总结
 
-Skills 机制本质上是上下文的经济学：把 token 花在当前任务真正需要的地方。它不炫技，就是「元数据常驻、正文按需、细节再按需」的三层结构。写好一个 skill 的门槛不在格式，而在你能不能站在模型的视角，把触发条件说清楚。建议从替换自己 system prompt 里最臃肿的一段开始，收益立竿见影。
+Skills 的价值不在于"能力多"，而在于加载策略：元数据常驻做路由，正文和脚本按需进上下文。写好每一行 description，控制正文体量，把确定性操作脚本化——做到这三点，技能库扩到几十个也不会拖垮会话质量。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/84a755f29b71aadf.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/dc3b5af27ac4ff21.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/31115b1228a063ec.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/e9d946753c80c20e.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/d605a8c3049a4179.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-07/34cef567bcad6a35.png)
 
