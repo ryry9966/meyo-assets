@@ -1,62 +1,68 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 36642
+feedId: 36657
 source: 综合讨论
 publishedAt: 2026-09-08
 ---
 
 ## 背景
 
-Agent 拿到 shell 工具之后，最大的风险不是它不够聪明，而是它太"听话"——幻觉、提示注入、或者一个没校验的变量，都可能让它执行 `rm -rf` 这类不可逆操作。OpenClaw 的设计前提很明确：不假设模型永远正确，而是假设它终将犯错，然后在错误发生时把爆炸半径限制住。
+让 Agent 拿到 shell 和文件工具，是提升自动化上限的必经之路，也是最让人睡不踏实的一步。提示词里写“请勿删除重要文件”没有任何强制力——模型抽风一次，`rm -rf` 就执行了。OpenClaw 在设计上没有走“祈祷式安全”路线，而是把边界做进了运行时。这篇帖子拆一下它的 sandbox 模型为什么能兜住这类事故。
 
-## 问题
+## 问题本质
 
-一条典型的翻车路径：用户说"清理一下构建产物"，模型生成 `rm -rf $BUILD_DIR/*`，而 `$BUILD_DIR` 在新开的 shell 里是空的，命令实际变成 `rm -rf /*`。当 agent 和你同权限、同文件系统时，这种错误没有任何拦截层，事后只有后悔。
+Agent 误删文件的根因不是“模型笨”，而是权限模型太宽：进程能看到整个文件系统，且删除动作没有独立的审批层。要解决，靠的不是更聪明的模型，而是默认拒绝 + 分层裁剪。
 
-## OpenClaw 的四层做法
+## OpenClaw 的分层做法
 
-**第一层：进程隔离。** 默认 sandbox 模式下，agent 的 exec 工具运行在容器内：非 root 用户、裁剪掉大部分 Linux capabilities、收紧的 seccomp profile。宿主机文件系统默认不可见，模型就算执行 `rm -rf /`，删的也只是容器自己的 overlay 层。
+**1. Workspace 隔离。** Agent 的默认作用域被限制在独立的工作区目录，文件工具的相对路径解析都锚定在这里。工作区之外，默认不可写。
 
-**第二层：最小挂载。** 只有 workspace 目录以 bind mount 方式进入容器，且可按需设为 read-only。agent 的可见世界就是你给它的那一个目录——"看不见"是最便宜的权限控制。
+**2. 工具策略（tool policy）。** 每个工具按 `allow / deny / ask` 三态配置。删除、覆盖类的 filesystem 操作建议保持 `ask`，宁可多确认一次。
 
-**第三层：工具策略与审批。** gateway 在工具调用链路上有 policy 层，可以按工具、按命令前缀做 allow/deny，对高危模式（递归删除、`dd`、`mkfs`、`chown /`）要求人工 approve 或直接拒绝。策略匹配发生在命令真正执行之前，prompt 劝不动它。
+**3. 沙箱执行。** 开启 Docker sandbox 后，Agent 的 exec 在容器内运行，宿主机文件系统默认不可见，只挂载工作区。即使命令失控，爆炸半径也被封在容器里。
 
-**第四层：审计与可回滚。** 每次 exec 调用连同完整命令、退出码落日志；workspace 建议初始化为 git 仓库，删除在版本控制里只是又一次 commit。
+**4. 危险命令审批。** exec 策略对高危命令模式（删除、递归写、`sudo` 等）单独设门，触发时转人工确认，并记录完整命令内容。
 
-## 配置步骤（可复现）
+**5. 审计日志。** 每次工具调用留下痕迹，事后能回答“它到底干了什么”。
 
-1. gateway 配置中将 agent 执行环境设为 sandbox（Docker）模式；
-2. 仅挂载 workspace，其余路径不进容器；
-3. tools policy 中 deny 递归删除类模式，exec approval 对白名单外命令生效；
-4. 容器内以非 root 运行，启用默认收紧 profile；
-5. workspace 初始化 git，作为最后兜底。
+四层叠起来才是有效防御：单看任何一层都有绕过方式，叠加后绕过成本远超收益。
+
+## 一个五分钟的验证实验
+
+1. 在工作区内放一个 `canary.txt`，工作区外的 `/tmp` 下也放一个；
+2. 要求 Agent “删除 /tmp 下的测试文件”；
+3. 观察结果：沙箱模式下 Agent 应该根本看不到工作区外的路径，或触发 ask；
+4. 再让它删除工作区内的文件，确认正常功能没被误伤。
+
+这个实验建议做成脚本，每次升级配置后跑一遍。
 
 ## 踩坑点
 
-- 为图方便把整个 home 挂进容器：第一、二层防线直接塌掉；
-- 把 docker.sock 挂进 sandbox：等于给 agent 发宿主机 root，这是最常见的"自制后门"；
-- workspace 里的软链接指向宿主机真实文件：容器内删除会穿透，挂载前先检查 symlink；
-- 审批疲劳：approval 弹窗太频繁，人会无脑点 yes，策略应收敛到真正高危的操作；
-- sandbox 不是备份：容器挡得住误删宿主机，挡不住误删挂载进来的 workspace 本身，快照仍然必须。
+- **把整个 home 目录挂进沙箱**：隔离瞬间失效，等于裸奔。只挂任务所需的最小目录。
+- **挂载 Docker socket**：容器里能控制宿主机 Docker，沙箱形同虚设。
+- **为图省事把 exec 设成全 allow**：审批层是最后一道闸，关掉后只剩容器隔离一层在扛。
+- **symlink 逃逸**：工作区里如果有指向外部的软链，写操作可能穿透边界。工作区保持干净，别塞杂链。
+- **多 Agent 共享 workspace**：一个 Agent 的清理脚本删掉另一个的中间产物，这类“合规误删”只有靠目录隔离能解。
 
 ## 可复用建议
 
-- 权限默认最小化，需要时再放开，不要反过来；
-- 破坏性操作约束放在策略层，不要靠 prompt 里写"请小心"——提示词是建议，策略才是约束；
-- 每个 agent 独立 workspace，避免交叉误伤；
-- 定期演练：故意让 agent 执行一次指向临时目录的 `rm -rf`，观察它落在哪一层被拦截。
+- 每个任务/每个 Agent 独立 workspace，最小挂载；
+- 删除与覆盖类操作永远保持 `ask`，确认疲劳也比恢复数据便宜；
+- 高危命令模式写在策略里，不要依赖模型“自觉”；
+- 用 canary 文件做定期回归，安全配置也要有 CI；
+- 出问题先看审计日志，别靠回忆复盘。
 
 ## 总结
 
-OpenClaw 不指望模型不犯错，而是默认它一定会犯错：容器隔离限制可见范围，最小挂载限制可触碰范围，工具策略限制可执行动作，版本控制兜底可恢复性。四层各自独立，任何一层失守，下一层还在。对自建 agent 的同学来说，这套"假设失败、限制半径"的思路，比任何单点配置都值得抄走。
+OpenClaw 防误删靠的不是提示词，而是“默认不可见、默认不可写、危险须确认、全程留痕”的权限边界。把 Agent 当成一个能力很强但偶尔犯错的实习生：不是反复叮嘱它小心，而是不给它机房的 root 钥匙。配置成本半小时，换来的是敢把自动化任务真正跑起来的底气。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/bd51202918edf6c3.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/e9bf8dd330938e3a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/fcf11b3c49f97162.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/829b523b4140e6b8.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/756f5d0d06ed34c9.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/86867322bab9a5c4.png)
 
