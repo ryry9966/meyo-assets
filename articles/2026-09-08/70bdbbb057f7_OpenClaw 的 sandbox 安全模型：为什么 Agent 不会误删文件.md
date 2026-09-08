@@ -1,57 +1,58 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 36524
+feedId: 36609
 source: 综合讨论
 publishedAt: 2026-09-08
 ---
 
 ## 背景
 
-让 Agent 自动整理目录、批量重命名、清理构建产物，是 OpenClaw 最常见的用法之一。但只要模型能直接调用删除类工具，就会有一个绕不开的问题：它错了怎么办？LLM 的失误不是恶意，而是工程问题——路径解析错了、把临时目录当成了目标目录、重试时幂等性没保证，甚至被注入的指令诱导。靠 system prompt 写一句“请不要删除文件”，在实践里基本靠不住。
+给 Agent 接上文件系统工具的那一刻，风险就从“模型答错一句话”升级成了“工作目录少了一个文件”。我们团队在把 OpenClaw 用于日常自动化（日志清理、构建产物管理、批量改配置）时，最先被问的问题不是“它能不能干活”，而是“它会不会手滑删了别的东西”。这篇帖拆一下 OpenClaw sandbox 的分层设计，以及为什么误删在我们的实践中基本被消除了。
 
-## OpenClaw 的做法：三层 sandbox
+## 问题
 
-OpenClaw 的设计原则是：模型可以“想”任何事，但“做”必须过沙箱。具体分三层：
+误删不是模型“故意”造成的，而是三个因素叠加：
 
-**1. 文件系统层。** 每个会话绑定一个 workspace root，工具的可见路径和 cwd 都被限制在 root 内。关键点在于：路径校验在工具网关侧做，网关会先 `resolve` 再比对，不信任模型传来的原始字符串。`..`、越界绝对路径、指向 root 外的 symlink 都会被拒绝。
+1. 模型对路径的幻觉——拼错目录、把相对路径当绝对路径；
+2. 工具调用链里缺乏统一的权限裁决点；
+3. 破坏性操作没有闸门就直接落盘。
 
-**2. 能力层。** 工具按 read / write / destructive 分级。删除、覆盖、批量移动默认 deny，必须在配置里显式加 allowlist。通过 MCP 接入的第三方工具同样要走 capability 声明——声明里没标 destructive 的，调用会被降级为 dry-run。
+只在 system prompt 里写“请小心操作”，等于把安全边界建立在概率上。
 
-**3. 执行层。** destructive 调用默认先写 audit log，并支持两种模式：`confirm`（人工确认后执行）和 `trash`（先移入 `.trash` 目录，可回滚）。Agent 拿到的返回是“已移入回收站”，对用户始终可恢复。
+## 做法：四层叠加的 sandbox
 
-## 如何验证你的 sandbox 生效
+**1. 命名空间隔离。** Agent 的所有文件工具运行在一个挂载的 workspace root 内，路径解析被强制限制在这个子树里。绝对路径越界、`..` 穿越、符号链接指向 sandbox 外的目标，都在路径规范化阶段被拒绝。这层在文件工具和 shell 执行器上同时生效。
 
-1. 检查配置里 workspace root 指向专用目录，不要图省事指向 `$HOME`；
-2. 用“越界探测”提示词测试：让 agent 读取 root 外的路径，预期是被拒绝而不是返回内容；
-3. 打开 audit log 跑一次删除任务，确认日志记录的是 resolve 后的路径和能力判定结果；
-4. 把删除模式设为 `trash` 跑一次，检查 `.trash` 目录和恢复命令是否可用。
+**2. 权限分级与默认拒绝。** 工具按 read / write / execute / destructive 四档声明权限，policy 默认只开读。写权限要在 profile 里显式授权；destructive 类操作（删除、覆盖、批量重命名）默认走确认门，由用户 approve，或配置为“仅允许匹配特定 glob 的路径”。
+
+**3. shell 命令拦截。** 模型绕过专用工具、直接调 shell 执行 `rm -rf` 是最常见的漏点。OpenClaw 在 shell 执行前做静态命令解析：命中删除/递归覆盖模式的命令，要么被改写为 sandbox 内的受控删除 API，要么直接拒绝并提示模型改用工具。
+
+**4. 审计与回滚。** 所有写操作落盘前先记操作日志；破坏性操作把目标文件移入 sandbox 内的 `.trash`，而不是直接 unlink。出问题时按操作序号回滚即可。
+
+配置上三步：profile 里指定 workspace root → 打开 write 权限并配置 destructive 确认策略 → 给 shell 拦截器加白名单（比如允许 `rm` 只作用于 `/tmp` 下的临时产物）。
 
 ## 踩坑点
 
-- **symlink 逃逸**：workspace 内软链到 root 外，OpenClaw 默认 resolve 后再校验，但如果你自己加了 volume 映射或挂载，要重新确认边界；
-- **MCP 工具未声明能力**：第三方 server 的 tool 描述里没写 destructive，网关会按 read 处理。接入新 server 先核对 capability 清单，必要时手动标注；
-- **Windows 路径**：大小写和分隔符问题，确保校验前统一 normalize；
-- **root 设得太宽**：沙箱只保证不越界，不保证界内不误伤。把整个仓库设为 root，agent 就能“合法地”删掉不该删的文件；
-- **confirm 疲劳**：确认弹窗太频繁，人会无脑点 yes。破坏性操作建议做聚合确认，一次审一批。
+- **root 挂太宽**：直接挂 `$HOME`，隔离层形同虚设。按项目挂子目录，宁可多建几个 workspace。
+- **符号链接是头号逃逸路径**：早期我们没开 symlink 出界检查，agent 通过仓库里一个指向外部的软链写穿了目录。现在默认拒绝解析出界的 symlink。
+- **MCP 侧门**：第三方 MCP server 自带的文件工具不走 OpenClaw 的路径裁决。接入前先审工具清单，或用代理层把它的文件访问包进同一套检查。
+- **拦截是启发式的**：`find ... -exec rm` 这类管道可能绕过模式匹配。别把 shell 拦截当唯一防线，它只是四层中的一层。
 
 ## 可复用建议
 
-- 安全边界永远不要建立在 prompt 上，prompt 是意图层，沙箱才是执行层；
-- 任何 destructive 工具先降级为可回滚（trash / 快照），稳定运行一段时间再考虑放开；
-- audit log 存 resolve 后的路径，不存原始参数，事后审计才有意义；
-- 把越界探测提示词放进定期任务或 CI，当成回归测试跑。
+把 Agent 当成“不可信新同事用的系统账号”来做权限设计：最小授权、默认拒绝、破坏性操作必须有闸门和回滚。另外，上 sandbox 之前先把工作目录纳入 git 或快照——这层兜底的价值比任何拦截器都高。
 
 ## 总结
 
-sandbox 的价值不是让 Agent 变得更聪明，而是让它的错误变得可恢复。三层模型 + 最小化 workspace + 默认 trash，基本覆盖了误删的主要路径。安全这件事，做到“出了错也能撤销”，比追求“模型永远不犯错”现实得多。
+OpenClaw 不依赖“模型表现良好”，而是假设它一定会犯路径错误、一定会尝试越权，然后用命名空间隔离、权限分级、shell 拦截、审计回滚四层把错误代价压到可恢复。实践里最大的体会是：sandbox 不是单个开关，而是一条从路径解析到落盘的完整链路——任何一环接了第三方工具或挂宽了目录，防线就会从那里开洞。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/80eb6032788b209c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/603b11359f9e84ff.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/db4f4dc8a0e1c3a6.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/1cfb99ef9562229b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/010c2f59f0baedb6.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/222885098265c222.png)
 
