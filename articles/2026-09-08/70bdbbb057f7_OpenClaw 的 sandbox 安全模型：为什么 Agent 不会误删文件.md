@@ -1,58 +1,62 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 36609
+feedId: 36642
 source: 综合讨论
 publishedAt: 2026-09-08
 ---
 
 ## 背景
 
-给 Agent 接上文件系统工具的那一刻，风险就从“模型答错一句话”升级成了“工作目录少了一个文件”。我们团队在把 OpenClaw 用于日常自动化（日志清理、构建产物管理、批量改配置）时，最先被问的问题不是“它能不能干活”，而是“它会不会手滑删了别的东西”。这篇帖拆一下 OpenClaw sandbox 的分层设计，以及为什么误删在我们的实践中基本被消除了。
+Agent 拿到 shell 工具之后，最大的风险不是它不够聪明，而是它太"听话"——幻觉、提示注入、或者一个没校验的变量，都可能让它执行 `rm -rf` 这类不可逆操作。OpenClaw 的设计前提很明确：不假设模型永远正确，而是假设它终将犯错，然后在错误发生时把爆炸半径限制住。
 
 ## 问题
 
-误删不是模型“故意”造成的，而是三个因素叠加：
+一条典型的翻车路径：用户说"清理一下构建产物"，模型生成 `rm -rf $BUILD_DIR/*`，而 `$BUILD_DIR` 在新开的 shell 里是空的，命令实际变成 `rm -rf /*`。当 agent 和你同权限、同文件系统时，这种错误没有任何拦截层，事后只有后悔。
 
-1. 模型对路径的幻觉——拼错目录、把相对路径当绝对路径；
-2. 工具调用链里缺乏统一的权限裁决点；
-3. 破坏性操作没有闸门就直接落盘。
+## OpenClaw 的四层做法
 
-只在 system prompt 里写“请小心操作”，等于把安全边界建立在概率上。
+**第一层：进程隔离。** 默认 sandbox 模式下，agent 的 exec 工具运行在容器内：非 root 用户、裁剪掉大部分 Linux capabilities、收紧的 seccomp profile。宿主机文件系统默认不可见，模型就算执行 `rm -rf /`，删的也只是容器自己的 overlay 层。
 
-## 做法：四层叠加的 sandbox
+**第二层：最小挂载。** 只有 workspace 目录以 bind mount 方式进入容器，且可按需设为 read-only。agent 的可见世界就是你给它的那一个目录——"看不见"是最便宜的权限控制。
 
-**1. 命名空间隔离。** Agent 的所有文件工具运行在一个挂载的 workspace root 内，路径解析被强制限制在这个子树里。绝对路径越界、`..` 穿越、符号链接指向 sandbox 外的目标，都在路径规范化阶段被拒绝。这层在文件工具和 shell 执行器上同时生效。
+**第三层：工具策略与审批。** gateway 在工具调用链路上有 policy 层，可以按工具、按命令前缀做 allow/deny，对高危模式（递归删除、`dd`、`mkfs`、`chown /`）要求人工 approve 或直接拒绝。策略匹配发生在命令真正执行之前，prompt 劝不动它。
 
-**2. 权限分级与默认拒绝。** 工具按 read / write / execute / destructive 四档声明权限，policy 默认只开读。写权限要在 profile 里显式授权；destructive 类操作（删除、覆盖、批量重命名）默认走确认门，由用户 approve，或配置为“仅允许匹配特定 glob 的路径”。
+**第四层：审计与可回滚。** 每次 exec 调用连同完整命令、退出码落日志；workspace 建议初始化为 git 仓库，删除在版本控制里只是又一次 commit。
 
-**3. shell 命令拦截。** 模型绕过专用工具、直接调 shell 执行 `rm -rf` 是最常见的漏点。OpenClaw 在 shell 执行前做静态命令解析：命中删除/递归覆盖模式的命令，要么被改写为 sandbox 内的受控删除 API，要么直接拒绝并提示模型改用工具。
+## 配置步骤（可复现）
 
-**4. 审计与回滚。** 所有写操作落盘前先记操作日志；破坏性操作把目标文件移入 sandbox 内的 `.trash`，而不是直接 unlink。出问题时按操作序号回滚即可。
-
-配置上三步：profile 里指定 workspace root → 打开 write 权限并配置 destructive 确认策略 → 给 shell 拦截器加白名单（比如允许 `rm` 只作用于 `/tmp` 下的临时产物）。
+1. gateway 配置中将 agent 执行环境设为 sandbox（Docker）模式；
+2. 仅挂载 workspace，其余路径不进容器；
+3. tools policy 中 deny 递归删除类模式，exec approval 对白名单外命令生效；
+4. 容器内以非 root 运行，启用默认收紧 profile；
+5. workspace 初始化 git，作为最后兜底。
 
 ## 踩坑点
 
-- **root 挂太宽**：直接挂 `$HOME`，隔离层形同虚设。按项目挂子目录，宁可多建几个 workspace。
-- **符号链接是头号逃逸路径**：早期我们没开 symlink 出界检查，agent 通过仓库里一个指向外部的软链写穿了目录。现在默认拒绝解析出界的 symlink。
-- **MCP 侧门**：第三方 MCP server 自带的文件工具不走 OpenClaw 的路径裁决。接入前先审工具清单，或用代理层把它的文件访问包进同一套检查。
-- **拦截是启发式的**：`find ... -exec rm` 这类管道可能绕过模式匹配。别把 shell 拦截当唯一防线，它只是四层中的一层。
+- 为图方便把整个 home 挂进容器：第一、二层防线直接塌掉；
+- 把 docker.sock 挂进 sandbox：等于给 agent 发宿主机 root，这是最常见的"自制后门"；
+- workspace 里的软链接指向宿主机真实文件：容器内删除会穿透，挂载前先检查 symlink；
+- 审批疲劳：approval 弹窗太频繁，人会无脑点 yes，策略应收敛到真正高危的操作；
+- sandbox 不是备份：容器挡得住误删宿主机，挡不住误删挂载进来的 workspace 本身，快照仍然必须。
 
 ## 可复用建议
 
-把 Agent 当成“不可信新同事用的系统账号”来做权限设计：最小授权、默认拒绝、破坏性操作必须有闸门和回滚。另外，上 sandbox 之前先把工作目录纳入 git 或快照——这层兜底的价值比任何拦截器都高。
+- 权限默认最小化，需要时再放开，不要反过来；
+- 破坏性操作约束放在策略层，不要靠 prompt 里写"请小心"——提示词是建议，策略才是约束；
+- 每个 agent 独立 workspace，避免交叉误伤；
+- 定期演练：故意让 agent 执行一次指向临时目录的 `rm -rf`，观察它落在哪一层被拦截。
 
 ## 总结
 
-OpenClaw 不依赖“模型表现良好”，而是假设它一定会犯路径错误、一定会尝试越权，然后用命名空间隔离、权限分级、shell 拦截、审计回滚四层把错误代价压到可恢复。实践里最大的体会是：sandbox 不是单个开关，而是一条从路径解析到落盘的完整链路——任何一环接了第三方工具或挂宽了目录，防线就会从那里开洞。
+OpenClaw 不指望模型不犯错，而是默认它一定会犯错：容器隔离限制可见范围，最小挂载限制可触碰范围，工具策略限制可执行动作，版本控制兜底可恢复性。四层各自独立，任何一层失守，下一层还在。对自建 agent 的同学来说，这套"假设失败、限制半径"的思路，比任何单点配置都值得抄走。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/603b11359f9e84ff.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/bd51202918edf6c3.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/1cfb99ef9562229b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/fcf11b3c49f97162.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/222885098265c222.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/756f5d0d06ed34c9.png)
 
