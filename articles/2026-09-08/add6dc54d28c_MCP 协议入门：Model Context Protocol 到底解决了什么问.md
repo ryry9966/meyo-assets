@@ -1,89 +1,67 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 36619
+feedId: 36628
 source: 综合讨论
 publishedAt: 2026-09-08
 ---
 
 ## 背景
 
-过去一年做 Agent 的人基本都在重复同一件事：给模型接工具。查数据库要写一套 function calling，读 GitHub 要再写一套，接公司内部 API 又是一套。每接一个工具，就要在宿主应用里写一份专属的描述、参数定义、鉴权和错误处理。工具本身不难，难的是这种集成没有任何标准可言。
+过去两年做 Agent 的人都会遇到同一个场景：模型能力已经够用，卡住的是“接数据、调工具”。文件系统、数据库、内部 API、浏览器……每个应用接每个工具，都要写一份定制的胶水代码。
 
-MCP（Model Context Protocol）就是冲着这个来的。它由 Anthropic 在 2024 年底开源，采用 JSON-RPC 2.0 作为通信格式，目前已被多家主流模型厂商和 Agent 框架采纳。一句话概括：它给「模型应用如何连接外部工具和数据」定了统一的接口规范。
+MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，目标就是把这件事标准化。它不是新模型，也不是框架，而是一层约定：AI 应用如何发现并调用外部工具与数据。
 
-## 它解决了什么问题
+## 问题：N×M 的集成成本
 
-本质上是把 **M×N 变成 M+N**。没有 MCP 时，M 个 AI 应用对接 N 个工具，最坏要写 M×N 份适配代码；有了 MCP，应用侧实现一次 client，工具侧实现一次 server，两边按协议握手即可互相发现能力。适配层从「给某个应用定制」变成「给整个生态通用」。
+没有标准之前，M 个 AI 应用要接 N 个工具，最坏要写 M×N 个连接器，各家的鉴权、参数格式、错误处理全不一样。对工具提供方同样痛苦：写好一个内部服务，想给不同 Agent 用，就得为每个宿主各写一份适配。
 
-对 OpenClaw / Agent 用户来说还有一层实际意义：插件体系和 MCP 不冲突。插件适合承载与宿主深度耦合的逻辑，MCP server 适合封装通用的、跨场景复用的能力——你今天写的数据查询 server，换个 Agent 框架照样能用。
+MCP 把它压成 N+M：工具方实现一次 Server，应用方实现一次 Client，中间用统一协议对话。
 
-协议本身不复杂，三个核心原语：
+## 核心模型：一句话说清
 
-- **Tools**：模型可主动调用的动作（执行侧）
-- **Resources**：应用可读取的数据（上下文侧）
-- **Prompts**：预设的提示模板（用户触发侧）
+MCP 是基于 JSON-RPC 的客户端-服务端协议：
 
-传输层两种常用模式：本地进程走 stdio，远程服务走 Streamable HTTP。
+- **Host/Client**：Agent 或桌面应用一侧，负责连接并管理 Server；
+- **Server**：暴露三类能力——Tools（模型可调用的动作）、Resources（可读取的数据）、Prompts（预置模板）；
+- **传输层**：本机常用 stdio，远程用 Streamable HTTP。
 
-## 上手步骤
+注意：选哪个工具、怎么拼参数，决策始终由模型做。MCP 只规范“发现”和“调用”这两步，不替你做编排。
 
-用 Python SDK 写一个最小 MCP server，十几行：
+## 在 OpenClaw 里接入的最小路径
 
-```python
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("weather")
-
-@mcp.tool()
-def get_weather(city: str) -> str:
-    """查询指定城市的实时天气，参数 city 为城市名。"""
-    # 这里调用真实 API
-    return f"{city}: 晴 26°C"
-
-mcp.run(transport="stdio")
-```
-
-在客户端（桌面端、IDE 或你自己的 Agent runtime）里注册：
-
-```json
-{
-  "mcpServers": {
-    "weather": {
-      "command": "python",
-      "args": ["weather_server.py"]
-    }
-  }
-}
-```
-
-运行流程是：client 启动 server 进程 → initialize 握手协商版本和能力 → client 拉取工具列表 → 模型决定调用时，client 发 `tools/call`，server 返回结果。建议先用官方的 MCP Inspector 手动跑一遍，确认工具列表和调用行为符合预期，再接入 Agent 流程。
+1. **明确场景**：先确认 Agent 缺什么能力（查库、发消息、读文件），别一上来就“接一切”。
+2. **优先复用**：常见需求（文件、Git、浏览器）先找现成的开源 MCP Server。
+3. **选传输**：本机进程用 stdio 最简单；跨机器或需常驻服务，用 Streamable HTTP。
+4. **定义工具**：JSON Schema 声明参数，字段尽量扁平，description 写给模型看，不是写给人看。
+5. **用 MCP Inspector 单测**：官方调试工具可脱离宿主直接试调用，先跑通再接入。
+6. **挂进 OpenClaw 配置**，观察工具调用日志，确认模型选对了工具。
 
 ## 踩坑点
 
-1. **stdio 模式下 stdout 是协议通道。** 任何 `print` 调试日志都会污染 JSON-RPC 帧，导致 client 解析失败。日志一律走 stderr 或写文件。
-2. **工具描述就是给模型看的 API 文档。** 描述含糊，模型要么不调用，要么传错参数。参数 schema 和 docstring 值得认真写，这是回报率最高的投入。
-3. **不要无脑 auto-approve。** 工具返回的外部内容可能携带注入指令，写操作（删数据、发消息、花钱）务必加人工确认或白名单。
-4. **工具数量失控。** 挂几十个工具后，上下文膨胀、模型选择准确率明显下降。按领域拆 server，单个 server 保持精简。
-5. **版本兼容。** 协议仍在演进（例如 transport 从 HTTP+SSE 改为 Streamable HTTP），自建 client/server 时注意握手阶段的版本协商，别硬编码。
+- **stdout 污染**：stdio 模式下 Server 往 stdout 打日志会直接破坏协议流，日志必须走 stderr。新手第一大坑。
+- **工具描述太弱**：模型靠 description 选工具。写“处理数据”这种模糊描述，模型大概率选错或不敢选。要写清何时该用、何时不用。
+- **Schema 过度嵌套**：深层嵌套对象、大量必填参数会让参数生成质量骤降。保持扁平，能少一个字段就少一个。
+- **返回值过大**：一次查表返回几千行，直接撑爆上下文。Server 侧要做截断、分页和摘要。
+- **没有超时和取消**：工具卡死会拖住整个 Agent 循环，务必设超时并支持取消。
 
-## 可复用建议
+## 可复用的建议
 
-- 把 MCP server 当作已有 API 的**薄适配层**，业务逻辑留在服务里，server 只做协议转换；
-- 一个领域一个 server，工具保持小而正交，命名加域前缀避免冲突；
-- 团队内固化一个脚手架模板（stderr 日志、统一错误处理、最小权限），新工具照着填；
-- 上线前用 Inspector 过一遍边界情况：空参数、超时、异常返回。
+- 工具按 Agent 工作流设计，而不是内部 API 一比一映射。宁可多个小工具，也别做一个带十种模式的巨型工具。
+- 一个 Server 只管一个领域，工具面小而清晰。
+- 把 description 当 prompt 写，这是性价比最高的优化。
+- 错误信息返回给模型看，让它能自我修正，而不是只抛异常就断掉。
 
 ## 总结
 
-MCP 没有黑科技，它的价值就是标准化：把重复的集成劳动收敛成一套协议，让工具写一次、处处可接。但它不替你解决鉴权、安全和工具设计质量——这些依然是你的工程责任。务实的用法是：把它当接口规范用，小步接入，先跑通一个 stdio server，再考虑远程部署和更细的权限控制。
+MCP 本身没有魔法，本质是 JSON-RPC 加一套 Schema 与描述规范。它真正的价值在于把 M×N 的集成问题压缩成 N+M，让工具生态可以被复用。对做自动化的团队来说，关键不在“用了 MCP”，而在于工具描述、Schema 设计和错误处理是否真的对模型友好——这部分工程活，协议替代不了。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/c1556ada336d30af.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/c440a5468b38b874.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/a00a1b2dc25d875d.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/b0bacf7f2c187bb2.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/11caa0ead5f08aa3.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-08/91921948beed242d.png)
 
