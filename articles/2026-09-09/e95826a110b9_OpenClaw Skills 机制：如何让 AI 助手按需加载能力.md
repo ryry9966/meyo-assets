@@ -1,81 +1,60 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 36672
+feedId: 36737
 source: 综合讨论
 publishedAt: 2026-09-09
 ---
 
 ## 背景
 
-过去半年我们在内部 Agent 项目里持续堆工具：代码检索、日志查询、工单操作、内部文档搜索，全部注册成 function calling 的 tools。结果是 context 里常驻几十份工具描述，token 开销大，模型在相似工具之间选错的概率也明显上升。
+给 Agent 扩能力，常见两条路：MCP 提供标准化工具接口，系统提示词注入过程性知识。前者解决"能调什么"，但接口之外还有大量"怎么用"的知识——内部部署流程、排障手册、固定操作套路。这类内容过去只能整段塞进 system prompt。
 
-OpenClaw 的 Skills 机制解决的就是这个问题：把“能力”从“始终在线”改成“按需加载”。
+## 问题
 
-## 问题本质
+我们早期把二十来份操作手册全文注入系统提示词，每次会话固定多出几万 token，而单次任务实际只会用到其中一份。更麻烦的是，大段无关指令会稀释模型注意力，该遵循的规范反而更容易被略过。能力全量加载，成本和精度两头受损。
 
-传统工具注册是全量注入，所有 tool schema 每次请求都进 context，带来三个问题：
+## Skills 的做法：两级加载
 
-1. token 成本随工具数线性增长；
-2. 工具越多，模型混淆概率越高；
-3. 复杂能力（比如一条完整的发布流程）靠单个 function 描述不清。
+OpenClaw 的 Skills 用的是渐进式披露（progressive disclosure）：
 
-Skills 的思路是把能力与触发时机绑定：平时只放一份极简元信息，命中条件后才加载完整内容。
+1. 每个 skill 是一个目录，核心是一个 `SKILL.md`。frontmatter 里的 `name` 和 `description` 常驻系统提示词，开销只有一两行；
+2. 正文（具体步骤、脚本说明、注意事项）默认不进上下文，模型判断当前任务命中某个 description 时，才去读全文。
 
-## Skills 的结构
+落地步骤：
 
-一个 Skill 本质是一个目录，核心是带 frontmatter 的描述文件：
+1. 在 workspace 下建 `skills/<name>/SKILL.md`；
+2. frontmatter 写 `name` 和 `description`；
+3. 正文写可执行的操作步骤，需要脚本时把脚本放在同目录，正文写清调用方式和路径；
+4. 重载后用一个典型问法验证触发。
 
-```text
-skills/
-  release-flow/
-    SKILL.md        # name + description + 触发条件 + 操作指引
-    scripts/
-      deploy.sh     # 可选：配套脚本
-    references/
-      runbook.md    # 可选：深度参考资料
-```
-
-关键在于三层渐进式披露（progressive disclosure）：
-
-- **第一层**：启动时只注入每个 Skill 的 name + description，几十 token；
-- **第二层**：模型判断任务匹配某 Skill，主动读取 SKILL.md 正文；
-- **第三层**：正文再引用 references/ 下的长文档，按需进一步加载。
-
-常驻开销从 O(全部文档) 降为 O(技能数 × 描述长度)。
-
-## 实操步骤
-
-1. 盘点现有工具，优先把“低频 + 高复杂度”的能力改造成 Skill；
-2. 写 SKILL.md：name 用小写连字符，description 一句话写清“什么时候该用我”，这是触发准确率的关键；
-3. 正文用 checklist 和命令片段组织，控制在 500 行以内，长内容拆到 references；
-4. 确定性步骤（构建、部署）放 scripts/，让模型调脚本而不是自由发挥；
-5. 灰度上线：先让测试 Agent 只挂这一个 Skill 跑真实任务，观察触发日志。
+关键认知：**description 是路由键，不是简介**。它决定 skill 会不会被加载。建议按"用于什么场景 + 什么信号触发"来写，把用户可能说的关键词埋进去。比如"用于发布服务。当用户要求上线、发版、回滚、查发布状态时使用"，远好于"处理发布相关任务"。
 
 ## 踩坑点
 
-- **description 含糊**是最常见失败原因。写“处理发布相关任务”不如写“代码合入 main 且用户要求部署到生产时使用”。
-- **数量失控**。超过 30 个后，光元信息就会挤占 context，需要按业务域分组或加路由层。
-- **硬编码路径和环境变量**，换台机器就失效，应统一从注入配置读取。
-- **Skill 互相引用未声明**，运行时才发现缺依赖，加载阶段应做一次依赖校验。
+- **description 太泛或太窄**：太泛会乱触发，太窄永远不触发。上线后看会话日志校准，比凭感觉改快得多。
+- **多个 skill 描述重叠**：模型会加载错的那份，然后按错误手册执行。用互斥关键词切分边界。
+- **正文过长**：触发瞬间吃掉大量上下文。主流程和细节拆开，正文只留主干，细节放同目录的引用文件，让模型按需再读。
+- **把 skill 当 MCP 用**：skill 适合沉淀过程性知识，MCP 适合暴露标准化接口。在 skill 里手写一堆 API 参数细节是反模式，能接 MCP 的别手写。
+- **路径问题**：脚本用相对 workspace 的路径，注意 agent 实际工作目录，否则会出现触发成功但执行失败。
 
 ## 可复用建议
 
-- 粒度标准：一个 Skill 对应“一个用户意图”，不要拆成“一个函数一个 Skill”；
-- description 按检索索引来写：“触发条件 + 输入 + 输出”三段式；
-- 脚本与文档分离，脚本要幂等、支持 dry-run；
-- 记录每个 Skill 的触发命中率，长期低于 10% 的考虑合并或下线。
+- 把 skills 当内部文档维护：进 git、走 review，谁踩了坑谁补一段，知识不会只留在某个人脑子里。
+- 高频组合操作优先沉淀成 skill。同一个流程口头描述十次，不如写成一份 skill 稳定。
+- 定期审计：哪些 skill 从未被触发（描述写偏了）、哪些频繁误触发（边界不清），各处理一批。
+- 和 MCP 分工：MCP 给工具，Skills 给方法，一个 skill 串起几个 MCP 工具，是最舒服的组合。
 
 ## 总结
 
-Skills 机制的价值不在“多一种插件格式”，而在于把 Agent 的 context 从静态全量改成动态按需。我们实测把 12 个低频工具收敛成 5 个 Skill 后，单次请求常驻 token 降了约 40%，工具误选率也明显下降。核心就一句话：让模型在任何时刻只看见它当前需要的能力。
+Skills 的本质是把 prompt 工程变成知识管理：常驻上下文的只有索引，正文按需加载。token 成本降下来，指令遵循精度反而上去，而且整套东西可版本化、可审计。如果你的 agent 已经接了 MCP，下一步值得做的就是把团队里重复出现的过程性知识沉成 skills——工具给手，方法给脑。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/26e75f095b597b64.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/4abb55c26c9060b7.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/190212352a1db013.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/7a566581d28cd4b1.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/d4981d735e0136fb.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/ba3054943f792f22.png)
 
