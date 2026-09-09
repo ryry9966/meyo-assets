@@ -1,60 +1,60 @@
 ---
 title: 跨平台消息路由：一个 Agent 同时服务 Telegram 和 Discord
-feedId: 36763
+feedId: 36773
 source: 综合讨论
 publishedAt: 2026-09-09
 ---
 
 ## 背景
 
-我们的 Agent 最初只跑在 Telegram 上，个人助手场景很顺。后来团队协作迁到 Discord，问题来了：再起一个 Agent 意味着两份 prompt、两份记忆、两套工具配置，还会出现“两边答案不一致”的尴尬。OpenClaw 的 Gateway 架构其实天然适合这件事——Agent 是单例，渠道只是适配器。真正的工作量不在“再接一个 bot”，而在中间那层路由。
+OpenClaw 的典型用法是“一个 Agent 绑一个渠道”。用得久了自然会遇到：白天在 Discord 服务器里协作，晚上在 Telegram 私聊问事。两个 bot 各一套会话、记忆和 prompt，上下文割裂，配置维护也是双份。这篇记录我们把同一个 Agent 同时接入 Telegram 和 Discord 的过程，重点在路由层设计，不讨论模型选型。
 
 ## 问题
 
-双渠道不是把 token 填两遍就完事，实际要解决四个问题：
+拆开看其实是四件事：
 
-1. **会话与身份**：同一个人在 TG 和 DC 上是两个身份，默认该隔离（`platform:chat_id` 作为 session key），什么时候允许合并？
-2. **格式差异**：Telegram MarkdownV2 的转义出了名的脆，Discord 有 2000 字符硬限制和自己的 markdown 方言。
-3. **媒体不对称**：语音消息、图片直链、CDN 过期，两边能力对不齐。
-4. **主动消息**：heartbeat、定时任务触发时，发到哪个渠道？谁决定？
+1. **接入层差异**：Telegram 走 long polling，Discord 走 gateway WebSocket，连接生命周期管理完全不同。
+2. **消息模型差异**：格式方言、长度上限（4096 vs 2000 字符）、附件、回复引用各不相同。
+3. **会话归属**：同一用户跨两个平台，共享记忆还是各开会话。
+4. **出站节奏**：两边限流规则不同，Agent 批量输出时很容易撞限。
 
 ## 做法
 
-拓扑保持简单：一个 Gateway，两个 channel adapter，共享同一个 Agent runtime。分五步：
+核心原则一句话：**适配器只做传输，不做智能**。
 
-1. **先定义内部消息 schema**。入站消息在 adapter 里归一化成统一结构：`text / media_refs / reply_to / thread_id / sender / platform / chat_id`。渠道私有特性（Discord 的 embed、TG 的 caption）留在 adapter，不往上游漏。
-2. **session key 用 `platform:chat_id[:thread_id]`**。群聊必须带 chat_id，否则两个群的上下文会串。需要跨平台身份合并时，用显式 allowlist 做 identity mapping，不要上模糊匹配。
-3. **出站走 per-platform renderer**。Agent 输出标准 markdown，渲染层负责：TG 侧做白名单转义（只保留代码块和粗体，其余转纯文本），DC 侧按 2000 字符在句子边界分片。
-4. **媒体先落地再引用**。两边把附件下载到共享存储，给 Agent 传本地路径，不要传平台 CDN 链接——过期和鉴权问题会留到半夜爆发。
-5. **灰度上线**。第一周 Discord 只做只读镜像（能收、能归档、不回复），确认路由日志没毛病再放开出站。
-
-主动消息我们定了条硬规则：每个定时任务必须声明 `target_channel`，没声明就路由到默认渠道并打 warning，绝不广播。
+1. **统一消息信封**。定义 `InboundMessage` / `OutboundMessage`，字段包括 `channel`、`chat_id`、`user_id`、`text`、`attachments`、`reply_to`、`correlation_id`，两端适配器都归一化到这个结构。
+2. **收敛适配器接口**为 `start() / stop() / send() / normalize()`。Telegram 侧用 `getUpdates` 长轮询（单实例部署，避开 webhook 冲突），Discord 侧交给官方网关库处理重连和心跳。
+3. **中央路由器**按 `chat_id` 维护会话，调用 Agent 核心（LLM + MCP 工具），响应按 `correlation_id` 回到原始渠道。工具异步执行也没关系——回包查的是信封字段，不是“当前会话”。
+4. **身份映射单独建表**：`platform_id → unified_user`。短期记忆按会话隔离，长期记忆（偏好、事实）按 unified user 共享，避免上下文串台。
+5. **出站统一进队列**，每个渠道挂一个令牌桶限流器，超长消息按段落边界分片，不做硬切字符。
 
 ## 踩坑点
 
-- **MarkdownV2 转义**：正则补丁修不完，最后干脆白名单渲染，丢一点格式换稳定。
-- **polling 和 webhook 同时开**：消息重复消费了一整晚才发现。渠道配置里加互斥检查。
-- **typing 指示**：Discord 的 typing 60 秒过期，长任务要续；TG 的 sendChatAction 只活 5 秒。统一在出站层做心跳续期。
-- **限速差异**：DC 是全局 + per-channel 双层限速，只按全局限速会被单频道打爆。
+- Telegram 解析模式直接用 HTML，别碰 MarkdownV2，转义规则能把人耗一整天。
+- Discord 后台记得开 MESSAGE CONTENT intent，否则收到的内容是空的且不报错，极易误判为路由问题。
+- 自己发的消息必须过滤，否则 bot 回复自己进死循环。
+- Telegram 同时开 polling 和 webhook 会 409 冲突；多实例部署要改 webhook + 单写者。
+- Discord CDN 附件链接有时效和 header 要求，拉取失败应走重试路径，而不是当成 Agent 错误抛给用户。
+- 会话完全共享实测体验很差：A 平台的问题被 B 平台的讨论污染。最终选了“会话隔离 + 记忆分层共享”。
 
 ## 可复用建议
 
-- **归一化要早，渲染要晚**：渠道怪癖全部关在 adapter 里，Agent 和 prompt 感知不到平台存在。
-- 每个渠道挂 feature flag，出问题可以单渠道降级到只读。
-- 路由决策打结构化日志（`in_platform → session_key → out_platform`），排查“为什么发到那边去了”全靠它。
-- 给路由层写单测：跨渠道同 session、超长分片、媒体缺失，都是能确定性复现的 case。
+- `correlation_id` 从入站打到出站日志，排障时一条链路追到底。
+- 适配器保持“笨”，格式转换、分片、限流全放核心侧，将来加 Slack 只需实现四个方法。
+- 录制真实入站消息做回放测试，比手写单测更能暴露格式问题。
+- 每个渠道一个 feature flag，语音转写这类单平台能力按渠道开关。
 
 ## 总结
 
-一个 Agent 服务多渠道，本质是把“理解消息”和“投递消息”拆干净。OpenClaw 的 adapter 模式给了正确的骨架，剩下的是工程纪律：统一 schema、严格的 session key、显式的路由规则。做完之后，新增一个渠道（比如 Slack）的边际成本大约是一个 adapter 加一个 renderer，两天以内能收工。这笔账算下来，早期在路由层多花的功夫都是值的。
+跨平台不是“多接一个 SDK”，而是把传输、会话、身份、限流四层拆干净。适配器薄、核心厚，路由靠信封字段而不是隐式状态——这套结构落定之后，接任何新渠道都是增量工作。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/fd89ff4c0b8a1008.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/5e0f2a0fb1c60144.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/38e7a9225ac7dae3.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/612756de72e3b46f.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/6a88a737b90ac960.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-09/26d5c023b04ba476.png)
 
