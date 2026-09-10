@@ -1,75 +1,58 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 36992
+feedId: 36994
 source: 综合讨论
 publishedAt: 2026-09-11
 ---
 
-## 背景：M×N 的集成困境
+## 背景：从 M×N 到 M+N
 
-大模型应用真正落地，绕不开两件事：让模型调用工具、让模型读取外部数据。2024 年之前这件事没有统一标准——每个 Agent 框架有自己的插件格式，每个工具都得为每个宿主单独写一遍适配。假设有 M 个模型应用、N 个数据源，最坏要写 M×N 个连接器，社区重复劳动严重。
+在 MCP 出现之前，把模型接上真实世界是个体力活。一边是 M 个客户端（各种 Agent 运行时、IDE 插件），一边是 N 个数据源和工具（文件系统、数据库、CI、工单系统），想让它们互通，理论上要写 M×N 份胶水代码。每换一个客户端，工具层就得重写一遍。
 
-MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，一句话概括：给「LLM 应用接入外部能力」定一个 USB-C 接口。宿主实现一次客户端，工具实现一次服务端，M×N 变成 M+N。
+MCP（Model Context Protocol）做的事很朴素：把"模型怎么调用工具、怎么读上下文"定义成一个开放协议。工具方实现一次 Server，任何支持 MCP 的客户端都能直接用，集成成本从 M×N 降到 M+N。
 
-## 它具体解决了什么
+## 问题：它到底解决了什么
 
-MCP 定义了三个核心原语：
+拆开看，MCP 标准化了三件事：
 
-- **Tools**：模型可主动调用的动作（查库、发请求、写文件）
-- **Resources**：可读取的上下文数据（文件内容、API 返回）
-- **Prompts**：预置的提示词模板
+1. **能力发现**：客户端连上 Server 后可以列出有哪些 tools、resources、prompts，不需要预先硬编码。
+2. **调用契约**：工具的入参出参用 JSON Schema 描述，调用走统一的 JSON-RPC 消息。
+3. **传输方式**：本地进程用 stdio，远程服务用 Streamable HTTP，客户端不用关心 Server 是 Python 还是 Go 写的。
 
-加上统一的发现机制（服务端自描述能力列表）和两种传输方式（本地 stdio、远程 Streamable HTTP），宿主不再需要关心每个工具的私有协议。
+换句话说，MCP 没有让模型变聪明，它只是把"接线"这件事标准化了。plumbing 的价值在于：工具生态可以独立于任何单一 Agent 框架生长。
 
-## 上手步骤：写一个最小 MCP Server
+## 做法：四步接入
 
-以官方 Python SDK 为例，本地 stdio 模式四步走：
-
-1. `pip install "mcp[cli]"`，用 `FastMCP` 起一个实例；
-2. 用装饰器注册工具，参数类型注解和 docstring 就是给模型看的 schema；
-3. 写业务函数，返回结构化结果，别返回巨型字符串；
-4. 用 `mcp dev server.py` 打开 Inspector 调试，确认工具列表和调用链路正常，再接入宿主。
-
-```python
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("demo")
-
-@mcp.tool()
-def query_order(order_id: str) -> dict:
-    """按订单号查询订单状态，返回状态与金额"""
-    return db.get_order(order_id)
-
-mcp.run()  # stdio 模式
-```
+1. **明确角色**：OpenClaw 这类运行时是 Host，内部为每个 Server 建一条 Client 连接；你写的工具暴露为 Server。
+2. **定义工具**：每个工具写清 name、description 和参数 schema。先从两三个只读工具开始，比如列目录、查状态。
+3. **选传输**：本地调试用 stdio 起子进程；需要共享给团队时再部署成带鉴权的 HTTP 服务。
+4. **用 Inspector 验证**：官方 MCP Inspector 可以脱离模型直接测工具调用，先把参数校验和返回格式跑通，再接进 Agent 链路。
 
 ## 踩坑点
 
-- **stdout 污染**：stdio 模式下 stdout 只能跑协议消息，`print()` 调试日志会直接把会话打挂，日志一律走 stderr 或文件。
-- **工具描述即路由依据**：模型选工具靠 name + description，描述含糊就会选错工具或编造参数。把描述当 API 文档写：什么时候该用、参数格式、返回什么。
-- **工具数量膨胀**：一个 server 挂 40 个工具，模型选择准确率明显下降。按领域拆分，单个 server 控制在 10 个左右。
-- **同步阻塞**：工具里塞了个 30 秒的同步请求，宿主侧直接超时。慢操作用 async，或返回任务 ID 供轮询。
-- **SDK 版本错配**：协议在演进（旧版 SSE 已被 Streamable HTTP 取代），client 与 server 的 SDK 版本差太多会握手失败，先对齐版本再排查。
+- **description 是写给模型看的**。模型靠描述决定调不调、怎么调，"查询数据"这种模糊描述会导致误调用；要写清何时用、何时不用、参数含义。
+- **工具太多会淹掉上下文**。几十个工具的 schema 本身就是 token 开销，模型选择准确率也会下降。按场景拆分 Server，或做工具过滤。
+- **参数校验失败的错误要回传给模型**。直接抛异常终止对话是浪费，把"哪个字段错了、期望什么格式"作为错误信息返回，模型大多能自我修正。
+- **stdio 模式吃环境**。子进程继承 shell 的 PATH 和编码，Windows 上的换行符、stderr 混入 stdout 都会让协议解析失败。日志一律走 stderr。
+- **安全别外包给协议**。MCP 不解决鉴权细节和提示注入。第三方 Server 返回的 resource 内容要当作不可信输入；有写操作的工具默认加确认层。
 
 ## 可复用建议
 
-- 本地开发用 stdio，团队部署再切 Streamable HTTP + 鉴权；
-- 先用 Inspector 调通再接宿主，不要在宿主里盲调；
-- 返回值做截断和分页，防止大结果吃掉上下文窗口；
-- 破坏性操作（删数据、对外发消息）强制加确认参数；
-- 每个 server 单一职责，工具命名带域名前缀，方便模型区分。
+- 工具粒度宁小勿大：小工具可组合，大工具的 schema 和错误分支都难维护。
+- 每次工具调用记日志（参数 + 截断后的结果），排查"模型为什么这么调"时，这是唯一可靠的证据。
+- 长耗时任务拆成"提交任务 + 查询进度"两个工具，别让一次调用挂住整个会话。
 
 ## 总结
 
-MCP 没有让模型变聪明，它做的是把集成成本从 M×N 压到 M+N：工具方写一次即可被所有兼容宿主使用，Agent 方接一次即可用上整个生态。对做自动化和插件的同学来说，与其为每个宿主写私有插件，不如把能力封装成标准 MCP Server——这才是它真正的工程价值。
+MCP 本质上是一套接线标准，它解决的是集成复用问题，不承诺任何智能增益。真正的工程价值取决于你如何设计工具边界、描述质量和安全边界。建议从两三个只读工具起步，跑通 stdio 调试链路，再逐步沉淀自己的 Server 库——工具集是会随业务复利的资产，胶水代码不是。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/4060943f7e895d2a.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/30dca91f28aa3318.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/b669a31a11277cbc.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/4895ab0395b612f6.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/62d17378ca3bd1ac.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/0b0843576a2c6b2d.png)
 
