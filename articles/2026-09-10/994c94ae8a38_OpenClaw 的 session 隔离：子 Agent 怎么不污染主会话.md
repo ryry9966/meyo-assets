@@ -1,73 +1,60 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 36844
+feedId: 36857
 source: 综合讨论
 publishedAt: 2026-09-10
 ---
 
 ## 背景
 
-用 OpenClaw 跑自动化久了，几乎一定会遇到同一个诉求：让主 Agent 派活给子 Agent——搜资料、跑批量任务、做代码审查、扫一堆文件。问题在于，如果子 Agent 的执行过程和主会话混在同一个 session 里，跑几次之后主会话的上下文就会被工具输出、中间推理和无关细节塞满，轻则响应变慢，重则主 Agent 的行为被"带偏"。
+OpenClaw 的典型玩法是：主 agent 挂着对话上下文和长期 memory，业务任务再派生一批子 agent——有的是插件的定时任务，有的是通过 MCP 拉起的一次性执行体。子 agent 跑得越多，一个老问题就越明显：主会话的上下文“越来越脏”。
 
-session 隔离要解决的就是这件事：子 Agent 干活，主会话只收结论。
+## 问题
 
-## 不隔离时实际会发生什么
+我们实际踩到的污染有三类：
 
-在我们的使用里踩过三类典型污染：
+1. **上下文膨胀**：子 agent 的中间输出（工具结果、长日志）被回写进主会话历史，几轮任务下来 token 占用翻倍，主 agent 的注意力被无关内容稀释，回答质量肉眼可见地下滑。
+2. **状态串写**：子 agent 和主会话共享同一份 memory，一个抓取任务把主会话里的用户偏好字段覆盖了，主 agent 之后的行为就“变了个人”。
+3. **事件回灌**：子 agent 内部的事件循环消息回流到主 transcript，重放时主 agent 把子 agent 的中间自言自语当成了对话历史。
 
-1. **上下文膨胀**：子任务跑几十轮工具调用，输出全部留在主会话历史里，几次之后主会话的可用水深明显缩水。
-2. **指令渗透**：子任务里的系统提示或工具返回内容被主 Agent 当成了"用户偏好"，后续对话莫名其妙多了奇怪约束。
-3. **状态串味**：子 Agent 改了共享的 memory 文件或 workspace，主会话下次读取时拿到的是子任务的临时状态。
+根因是同一个：子 agent 与主会话之间的数据边界是隐式的，进出全靠默认行为。
 
-## 做法：一次干净的 spawn
+## 做法
 
-OpenClaw 里子 Agent 通过 `sessions_spawn` 派生，核心思路是：**子任务拿独立 session、独立工作目录、只回传摘要**。大致是这样（不同版本参数名略有差异，以你部署的版本文档为准）：
+我们的隔离方案分四步：
 
-```json
-{
-  "task": "审查 src/plugins/ 下所有 PR，只输出风险清单和修复建议",
-  "cwd": "/workspace/review-task",
-  "sandbox": true,
-  "sessionKey": "agent:review:task-20250611",
-  "timeout": "15m"
-}
-```
+**1. 显式隔离 spawn。** 派生子 agent 时不复用主 session id，而是生成独立 session：子 agent 拿到空白上下文 + 任务描述，主会话历史对它不可见。
 
-几个关键点：
+**2. 结果回传走 schema。** 子 agent 结束时只回传结构化摘要，字段约定为 `status / result / error / token_used`，主会话只追加这条摘要。全量 transcript 留在子 session，按需落盘归档，不进主上下文。
 
-- **task 写成"任务简报"而不是"对话"**。只给目标、范围、输出格式，不要把主会话的历史粘贴进去。子 Agent 需要的背景，摘成三五句话。
-- **cwd 和 sandbox 单独开**。让子 Agent 在独立目录里读写，配合沙箱限制它碰共享 memory 和主 workspace。
-- **sessionKey 显式命名**。方便事后查这个子任务到底干了什么，也避免复用旧 session 带进残留上下文。
-- **约定输出格式**。比如"只返回 JSON 风格清单，不超过 300 字"，主会话收到的就是一小段结论，而不是一整条执行轨迹。
+**3. 共享状态显式化。** 需要跨 agent 共享的数据放 workspace 的键值存储或文件，读写在代码里显式完成。主 memory 对子 agent 只读，或干脆不给权限。
 
-主会话侧只做一件事：把 spawn 返回的结果摘要接进自己的推理，然后继续。中间过程不进历史。
+**4. 权限与预算收敛。** 子 agent 只挂载任务必需的 MCP 工具；同时设轮数上限、token 上限和超时，超限直接终止并返回失败摘要，避免失控的子 agent 反复回写。
 
 ## 踩坑点
 
-- **把主会话整段 history 塞进 task**。这是最常见的污染源，子 Agent 会把主会话的语气、未完成话题全带进去。背景要"翻译"成任务简报，不能直接搬运。
-- **忘了子 Agent 也会写 memory**。共享 memory 文件如果没隔开，子任务的临时结论会被主会话当成长期记忆。要么单独 memory 路径，要么明确禁止子 Agent 写长期记忆。
-- **没设 timeout 和轮数上限**。子任务跑飞了会一直占资源，而且失败结果可能超长回灌。务必给上限。
-- **channel 绑定被继承**。子 Agent 有时会继承主会话的消息通道，导致它"替主 Agent 说话"。spawn 时确认会话是隔离的、不对外发消息。
-- **结果摘要忘了约束长度**。一句"总结一下"可能换来两千字，隔离的意义就打折了。
+- 最早忘了关子 agent 的流式回传，每条中间消息都进了主历史，隔离形同虚设。上线前要专门确认 `stream_to_parent` 类开关是关的。
+- 摘要回传一开始没做 schema 校验，某个子 agent 直接把原始日志塞进 `result` 字段——污染只是换了个形式回来。后来加了校验 + 长度截断。
+- 并发子 agent 共用同一个临时目录，两个任务互相覆盖中间文件。改成每个子 session 独立 scratch 目录。
+- 重试逻辑会把失败子 agent 的“半成品输出”也回灌，改成只有成功才回传，失败只回错误码和原因。
 
-## 可复用的几条建议
+## 可复用建议
 
-- 把子任务简报做成固定模板：目标 / 范围 / 禁止事项 / 输出格式，每次填空。
-- 一类任务固定一类 sessionKey 前缀，出问题时能按前缀批量排查。
-- 定期把子任务 session 归档或清理，别让隔离 session 无限堆积。
-- 怀疑主会话被污染时，直接开新 session 重建上下文，比重启整套部署便宜得多。
+- 把“主会话只追加结构化摘要”写成团队规范，进 code review checklist。
+- 隔离分三档：**fully isolated / read-only shared / shared scratch**，按任务性质选档，不要一刀切。
+- 监控每个子 agent 的 token 消耗和回传体积，异常膨胀就是隔离失效的第一个信号。
 
 ## 总结
 
-session 隔离不是什么高级特性，核心就三条：**独立 session、独立工作区、只回传摘要**。把它做成派活的标准动作，主会话才能长期保持"干净的水深"，多 Agent 编排才不会越用越糊。建议先从你最高频的那个自动化任务开始，把它的子 Agent 改造成隔离模式，跑一周对比一下主会话的表现，差异会很明显。
+session 隔离的本质不是某个技术开关，而是边界的显式化：子 agent 和主会话之间进什么、出什么、共享什么，都应该写成声明式的契约。把 spawn 隔离、回传 schema、权限收敛这三件事钉死之后，主会话的干净程度是可以长期稳定保持的——这也是 OpenClaw 编排规模化跑起来的前提。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/b5037c1f932010da.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/c6f400326ec76cc5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/216b7105e14e1498.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/9e8e4f1356eece3a.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/c69b5d786f8dc8d2.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/d0e2c9598ba4a7ad.png)
 
