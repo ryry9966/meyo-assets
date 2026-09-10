@@ -1,68 +1,77 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 36855
+feedId: 36931
 source: 综合讨论
 publishedAt: 2026-09-10
 ---
 
+# OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
+
 ## 背景
 
-让 Agent 直接操作文件系统，是自动化收益最大、也最容易出事的场景。OpenClaw 的 Agent 默认带文件读写和 shell 类工具，社区里被问得最多的问题之一就是："它会不会哪天把我整个目录删了？"这篇文章拆一下 OpenClaw 的 sandbox 模型。先说结论：**"不误删"不靠模型自觉，靠的是一组默认生效的机制。**
+给 Agent 接上 shell 和文件系统工具之后，大家最担心的从来不是"它能不能干活"，而是"它会不会干错活"。一次 `rm -rf`、一次错误的通配符展开、一次写错的目标路径，代价都可能是不可逆的。OpenClaw 在这块的思路很明确：不靠提示词求模型手下留情，而是把边界做进执行层。
 
 ## 问题
 
-模型侧的风险是真实的：路径幻觉（把 `~/projects` 写成 `~/`）、glob 过宽（清理 `*.log` 结果匹配到源码）、插件工具权限过宽、子进程逃逸。这些不是假设，群里就有人贴过 Agent 在错误工作目录执行 clean 的案例。单靠 prompt 约束不可靠，所以 OpenClaw 把安全放在工具层和系统层，而不是指望模型"懂事"。
+常见的两种极端方案都有缺陷：
 
-## 做法：五层闸门
+- 不给文件工具：安全，但自动化场景基本残废；
+- 全量给权限：功能完整，一次幻觉就是一次事故。
 
-1. **工作区 jail**：每个会话绑定一个 workspace root，所有文件工具的路径先做 canonicalize（解析 symlink、展开 `..`），越出 root 的读写直接拒绝。这是最底层兜底。
-2. **操作分级**：读、写、删是三种权限。删除类操作（unlink、递归删除、截断覆盖）默认不授予权限，需要显式开启。
-3. **路径策略**：allowlist 只放行 workspace 内路径；denylist 硬挡 `~/.ssh`、`~/.config`、`/etc` 等高危位置，且不可被会话内指令覆盖。
-4. **软删除 + 审计**：sandbox 内的删除不直接 unlink，先移入 `.openclaw/trash/<session>/`，同时写 audit log（时间、原路径、调用工具）。会话内可一键回滚。
-5. **危险操作 dry-run**：批量删除或覆盖前，工具层强制先产出 affected-files 列表，确认后才执行。
+至于"在 system prompt 里写一句请勿删除文件"，那属于心理安慰——长上下文、注入攻击、模型波动，任何一条都能让它失效。我们要的是：**能力可用，边界由系统强制，而非模型自觉。**
 
-MCP/插件侧，每个工具的 manifest 必须声明 scope（`fs:read` / `fs:write` / `fs:delete`），sandbox 在调用时校验，声明与实际行为不符会被拒绝并告警。
+## 做法：四层防御
 
-典型配置：
+OpenClaw 的 sandbox 模型可以拆成四层，各管一段：
+
+**1. 进程隔离。** 所有工具调用（shell、文件读写、MCP server 拉起的子进程）都跑在受限容器里，使用专用低权限用户，宿主文件系统默认不可见。模型拿到的 shell 环境本身就是缩小过的。
+
+**2. 文件系统视图收窄。** 只有显式声明的工作目录会被挂载进 sandbox。`~/.ssh`、项目外的目录，在 sandbox 视角里根本不存在——模型想删也没有路径可寻址。这比"拦截删除命令"更前置。
+
+**3. 策略层拦截。** 路径白名单 + 危险模式检测：递归强删、向系统路径重定向、对白名单外路径的写操作，默认 deny。低风险写放行，高风险动作（删除、覆盖已存在文件）走审批闸门。
+
+**4. 兜底层。** 通过策略的删除不直接落盘，先进 sandbox 外持久卷上的 trash 目录，配合定时快照。就算前三层被绕过，也留得下恢复手段。
+
+配置上大概是这个形状：
 
 ```yaml
 sandbox:
-  root: ./workspace
-  follow_symlinks: false
+  mounts:
+    - src: ./workspace
+      mode: rw
   policy:
-    fs:delete: confirm   # confirm | deny | allow
-  deny:
-    - ~/.ssh/**
-    - ~/.config/**
-  trash: .openclaw/trash
+    delete: confirm      # 高风险动作走审批
+    paths_allow:
+      - ./workspace/**
 ```
 
 ## 踩坑点
 
-- **symlink 逃逸**：workspace 里一个软链指向 `/home`，旧版本 `follow_symlinks` 默认开启。请显式设为 `false`。
-- **子进程绕过**：Agent spawn `bash -c "rm ..."` 走的是系统层 jail 拦截，但如果你同时给了 execute 权限又没限 root，等于白设。生产会话建议不给 execute，用受控的 run 工具。
-- **插件私带 fs 实现**：有的插件直接调裸文件 API 不走 gate，manifest 校验拦不住行为不符，只能靠装前审计——看它用的是官方 toolkit 还是裸 API。
-- **glob 展开位置**：展开发生在 sandbox 内部不会越界；旧版本交给外部 shell 展开会"先炸再拦"，升级可解。
-- **临时目录误报**：tmpdir 配在 workspace 外，批量生成任务会被拦，属策略误报，把 tmpdir 挪进 root 或加入 allowlist。
+实测下来有几个容易翻车的地方：
+
+- **软链接逃逸。** 工作目录里若存在指向宿主的 symlink，挂载跟随解析会让边界直接失效。挂载时必须 `nofollow`，并对运行期新建的链接复检。
+- **trash 放在 sandbox 里。** 容器销毁时回收站跟着一起没了，兜底层等于不存在。trash 卷必须在 sandbox 生命周期之外。
+- **审批疲劳。** 把所有写操作都设成审批，人很快会变成无脑点"允许"的机器。只保留删除/覆盖类高风险动作，其余交给策略。
+- **通配符只查原始命令。** 对 `rm dir/*` 拦字符串没有意义，要在 shell 展开之后对实际路径集合再做一次策略复检。
 
 ## 可复用建议
 
-- 默认最小权限，destructive 永远显式开；
-- 上线前跑一组红队用例：让 Agent 尝试写 root 外、删 denylist 文件、经 symlink 越界，预期全部失败且 audit 有记录；
-- 定期 review 插件 manifest 的 scope 声明；
-- trash 和 audit log 别关，出事后它们是唯一的取证手段。
+- 默认 deny，显式 allow，挂载路径集合做到最小；
+- 三道防线各司其职：隔离管"看不见"，策略管"做不了"，快照管"万一做了"；
+- 所有写/删操作落审计日志，事后能完整复盘模型的每一步；
+- 定期跑红队用例：故意让 agent 执行危险任务，验证边界是配置保证的，不是运气。
 
 ## 总结
 
-"Agent 不会误删文件"，不是因为模型足够聪明，而是最短路径上每一步都有闸门：路径规范化挡越界，权限分级挡误操作，软删除和 dry-run 兜住不可逆，manifest 校验约束生态。分层防御的意义在于：任何一层失效，都不会直接变成事故。建议大家回头检查自己的 sandbox 配置，尤其是 `follow_symlinks` 和 `fs:delete` 这两项。
+"Agent 不会误删文件"不是模型听话，而是即便它想删，也看不见目标路径、绕不过策略闸门、删了也能恢复。安全边界必须落在系统层，提示词只是体验优化。这套四层结构不复杂，但在真实的自动化任务里，它就是"敢让 agent 跑过夜"和"不敢"之间的差距。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/16d3393bde42261a.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/86c2ccc609d86a5b.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/17ea040ae7f5afb6.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/e4b32f61feb52b8f.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/25ff62841e866dfc.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/9f98cae27629f76a.png)
 
