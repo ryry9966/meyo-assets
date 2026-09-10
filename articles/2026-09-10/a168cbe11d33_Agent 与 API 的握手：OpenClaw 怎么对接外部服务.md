@@ -1,73 +1,74 @@
 ---
 title: Agent 与 API 的握手：OpenClaw 怎么对接外部服务
-feedId: 36938
+feedId: 36943
 source: 综合讨论
 publishedAt: 2026-09-10
 ---
 
 ## 背景
 
-用 OpenClaw 做过一点实际事情的都知道：agent 本体只负责推理和决策，真正干活的是它挂载的 tools / skills。无论是查订单、调搜索、触发 CI，还是读写内部系统，本质都是同一件事——把一个 HTTP API 翻译成 agent 能稳定使用的工具。OpenClaw 提供两条接入路径：MCP server 和原生插件（tool 定义直接写在配置里），本文不纠结选型，聚焦握手本身。
+Agent 本身只会"想"，不会"做"。OpenClaw 作为常驻的 agent 运行时，真正的价值在于把模型推理和真实服务连起来：查工单、发通知、读写内部数据。这个连接点，就是今天说的"握手"。它决定了 agent 是玩具还是工具。
 
 ## 问题
 
-实际翻车的场景很少是"连不上"，更多是"连上了但 agent 用不好"：
+社区里常见的三种错误姿势：
 
-- 工具描述含糊，agent 乱传参数或在该调用时不调用
-- API key 硬编码进配置，或被完整打进日志
-- 没有超时和重试策略，一次网络抖动让 agent 幻觉式总结"服务已下线"
-- 原始返回体太大，几次调用就撑爆上下文
+1. 把 API 文档整段塞进 system prompt，让模型自己"脑补"调用——参数靠猜，成功率看运气；
+2. 在 skill 里写死一次性 curl 脚本——鉴权散落各处，没有错误处理，换个环境就挂；
+3. 工具无节制地堆——几十个工具挤在上下文里，模型开始选错、串参。
+
+本质问题是：模型需要的不是一份原始文档，而是结构化、边界清晰的工具契约。
 
 ## 做法
 
-以把一个内部订单查询 API 接成 tool 为例，步骤如下：
+推荐统一走 MCP 工具这条路，四步：
 
-**1. 定义 schema。** name 用动词短语（`query_order`），参数给显式类型、enum、required。description 是写给 agent 看的文档，重点写"什么时候该用、什么时候不该用"：
+**第一步：封装而不是直连。** 给目标服务写一个薄封装的 MCP server，把 API 翻译成"动词型"工具：`query_order`、`create_ticket`。每个工具只做一件事，参数用 JSON Schema 定义，description 写清楚何时该用、何时不该用。
 
-```yaml
-name: query_order
-description: 当用户询问订单状态或物流时调用；输入订单号；
-  查不到返回 not_found，此时应告知用户而非重试。
-parameters:
-  order_id: { type: string, required: true }
-  status_filter: { type: string, enum: [all, shipped, pending] }
+**第二步：鉴权走环境变量。** API key 放 env，配置里只留引用，绝不明文落盘、更不能进 git。挂载示意（字段以你所用版本为准）：
+
+```json
+{
+  "mcpServers": {
+    "ticket-api": {
+      "command": "node",
+      "args": ["./mcp/ticket-server.js"],
+      "env": { "TICKET_API_KEY": "${TICKET_API_KEY}" }
+    }
+  }
+}
 ```
 
-**2. 写 connector 层。** 插件里只做三件事：参数校验、HTTP 调用、返回裁剪。不要把原始 JSON 整个丢回上下文——挑关键字段、截断长文本、必要时补分页参数。
+**第三步：注册后做最小验证。** 重启 OpenClaw，用一句最小指令试跑："帮我查一下最近三个工单"。观察它是否选对工具、传对参数，而不是急着接入正式流程。
 
-**3. 凭证管理。** key 走环境变量或 secret 文件，配置里只留引用名，日志统一脱敏。
-
-**4. 错误语义映射。** 这是最容易被忽略的一步。"订单不存在"和"服务暂时不可用，可稍后重试"在 agent 眼里必须是两种信号，后者要带 retryable 标记，否则 agent 会把临时故障当永久事实。
-
-**5. 超时与重试。** 连接超时 3–5s，总超时按业务定；只对幂等请求重试，指数退避，上限 2 次。重试决策放在 connector 里，不要让 agent 自己决定——它没有判断重试成本的上下文。
-
-**6. 单测再接入。** 用调试模式固定输入跑这个 tool，先看原始返回是否符合预期，再挂进 agent 流程。
+**第四步：给错误留出口。** 外部 API 一定会有超时、限流、5xx。工具返回值要结构化，把错误也当成"可推理的数据"还给模型，让它能决定重试、换路或放弃——而不是抛一个裸异常让它瞎猜。
 
 ## 踩坑点
 
-- description 写成给人看的 API 文档是常见错误。"查询订单"不如"用户问到订单状态或物流时调用，输入订单号，查不到返回 not_found"。
-- 日期、时区类参数出错率最高，schema 里直接给格式示例。
-- 返回裁剪别过头，字段名要保留语义，否则 agent 等于瞎猜。
-- 对接免费额度 API，上线后被 agent 循环调用打爆限流，记得在 connector 侧加自己的限流。
-- 路径选择：需要动态发现、多客户端复用选 MCP server；单一内部服务追求低延迟，直接写插件更省事。
+- description 写得太含糊，模型把可选参数当必填，或干脆不传关键参数；
+- POST 类操作没考虑幂等，agent 自动重试一次，订单创建了两个；
+- 返回体太大，一次查询吃掉半个上下文窗口，后续对话质量直线下降——在工具层做字段裁剪和分页；
+- 没设超时，外部服务挂了，agent 卡死在等响应；
+- 调试日志打了完整请求头，key 顺带泄漏。
 
 ## 可复用建议
 
-- 沉淀 tool 四件套模板：schema + connector + 错误映射 + 测试用例，新 API 照抄结构，半小时接入。
-- 所有外部调用收敛到一个共享 HTTP client，统一超时、重试、脱敏日志，别每个插件各写一套。
-- 给每个 tool 记录调用指标（成功率、p95 延迟）。agent 行为异常时，先看这里，再看提示词。
+- 一个领域一个 MCP server，单域工具数控制在个位数，宁缺毋滥；
+- 返回值统一"结构体 + 状态"风格，方便模型判断下一步；
+- 新工具先灰度一周：只给自己用，看调用日志再放开；
+- 定期 review 工具清单，删掉三个月没被调用的——工具越少，选错率越低。
 
 ## 总结
 
-对接外部服务的难点不在 HTTP，而在"翻译"：schema 是契约，connector 是边界，错误语义是体验。把这一层做扎实，agent 才不会在每次握手上掉链子。欢迎在评论区交流你们踩过的坑。
+对接外部服务的核心不是"能调通"，而是给模型一个诚实、边界清晰、可失败的接口。工具写得越像一份严谨的契约，agent 的行为就越可预测。握手这件事，主动权始终在写接口的人手里。欢迎在评论区贴出你的封装方案和踩坑记录。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/4a8e1711f19563a1.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/4c140b9d767f4e8d.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/a968a8f7852d4cfa.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/42470b6ef2386ee6.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/f40b4a4df2653429.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/8366f0ff8214f811.png)
 
