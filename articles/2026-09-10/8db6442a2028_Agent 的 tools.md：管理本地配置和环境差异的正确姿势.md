@@ -1,78 +1,77 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 36900
+feedId: 36927
 source: 综合讨论
 publishedAt: 2026-09-10
 ---
 
 ## 背景
 
-Agent 跑起来之后，真正反复消耗你时间的往往不是任务本身，而是它每次都要重新认识你的机器：这个环境用 brew 还是 apt？是 python 还是 python3？某个 MCP server 到底注册了没有？这些信息散落在 shell rc、.env、MCP 配置文件和你的脑子里，agent 只能靠现场试探，猜错一次就是一轮重试和烧上下文。
+跑 Agent 做本地自动化时，最大的不稳定因素往往不是模型，而是环境。同一套 MCP server、同一段工具调用，在 A 机器上跑通，到 B 机器就报路径不存在、Python 版本不对、key 没注入。Prompt 和插件可以 git 同步，但每个人的 shell、PATH、代理、GPU 状态都不一样。Agent 对环境的全部认知来自你喂给它的上下文——tools.md 就是干这个的：给 Agent 一份可信的环境快照。
 
-tools.md 的定位很朴素：把"这台机器/这个项目有什么工具、有什么约定"固化成一份受版本管理的清单，放在 agent 一定会读的地方。
+## 问题：环境差异是怎么坑 Agent 的
 
-## 问题
+几个常见症状，大概率你都遇到过：
 
-没有这份清单时，常见症状包括：
+- **配置散落**：`.zshrc`、`.env`、MCP 配置、README 各写一份，互相矛盾，谁也不确定哪份是真的。
+- **工具幻觉**：上下文里没说清哪些工具可用、怎么调用，Agent 就编一个不存在的命令，然后在不存在的报错里越走越远。
+- **文档漂移**：tools.md 三个月前写的路径，早随着重构失效了，没人发现。
+- **密钥泄漏**：为了“让 Agent 看得见”，把 key 直接写进仓库里的配置文件。
 
-- 同一任务在 macOS 笔记本、Linux CI、容器里表现不一致。典型如 BSD sed 和 GNU sed 的 `-i` 参数差异，agent 在 macOS 上跑 GNU 写法直接报错。
-- MCP 注册信息和实际环境脱节：文档里写了三个 server，实际只起了两个，agent 反复调用失败的那个。
-- 多人（或多 agent）共用仓库，各自踩一遍环境坑，知识无法沉淀。
-- 环境事实和密钥混着写，一不小心 API key 就进了上下文和日志。
+根因都一样：环境事实没有单一来源，也没有验证手段。
 
-## 做法
+## 做法：五段式 + 分层覆盖
 
-核心原则：**tools.md 只记录事实，不承担操作职责**。推荐分区：
+**1. 确定单一事实源。** 工具清单只维护一份 tools.md，放在项目根目录（个人全局工具放 `~/.config/` 下）。MCP/插件配置引用它，不要两边各写一套。
+
+**2. 分层：通用事实与本机差异分离。** `tools.md` 进 git，写通用内容；`tools.local.md` 加进 `.gitignore`，只写本机绝对路径、端口、代理开关。Agent 加载时先读前者，存在后者则覆盖。
+
+**3. 固定五段结构，密度优先：**
 
 ```markdown
 # tools.md
-## platform
-- macOS 14 / arm64，Homebrew；GNU 工具用 g 前缀（gsed、gawk）
-## runtimes
-- node 22（fnm 管理），自检：node -v
-- python 3.12（uv 管理），自检：uv --version
-## mcp
-- filesystem: npx xxx-server-filesystem ./（stdio，项目级）
-- sqlite: uvx mcp-server-sqlite --db-path ./data.db
-## env
-- OPENCLAW_API_KEY：必填，值见 .env，本文件只写名字和用途
-## quirks
-- sed -i 一律用 gsed；路径避免绝对用户目录
+## 工具清单
+- python-runner: 执行 Python 片段，依赖 Python 3.11+
+## 环境矩阵
+| 项       | 本机            | CI          |
+|----------|-----------------|-------------|
+| Python   | 3.12 (pyenv)    | 3.11        |
+| 工作区   | ~/work/proj     | /workspace  |
+## Preflight
+开工前运行 `bash check_env.sh`，失败则停止并报告缺失项
+## 密钥
+- LLM key: 读环境变量 $LLM_API_KEY，缺失时报错，不要猜
 ```
 
-落地步骤：
+**4. 声明可验证的检查。** 配一个 `check_env.sh`，逐条校验路径、版本、环境变量。tools.md 里明确要求 Agent 开工前先跑它——把环境验证从“撞了再说”变成前置动作。这份脚本同样进仓库，CI 复用同一份。
 
-1. **分层**。全局环境放 `~/.openclaw/tools.md`（个人机器事实），项目根放项目依赖和 MCP 注册，主机差异用 `tools.darwin.md` / `tools.linux.md` 小文件叠加，避免单文件里 if-else 堆积。
-2. **用探测脚本生成初稿**。用 `command -v`、`--version` 扫一遍常用工具，吐出草稿，人工审核后入库。生成物只是起点，不是自动维护机制。
-3. **约定 agent 行为**：执行前先读 tools.md；发现文档与现实不符时，报告差异，而不是擅自改文档或绕过。
-4. **和现实锁死**。把清单里的自检命令抽出来在 CI 跑一遍，文档过期就红。
+**5. 文档跟着代码走。** 工具改动和 tools.md 更新放同一个 PR，review 时把文档当代码看。
 
 ## 踩坑点
 
-- **把密钥写进 tools.md**。这个文件会整体进入上下文，等于公开。
-- **越写越长**。超过一百行就该删减或拆分，上下文不是免费的。
-- **写绝对路径**。`/Users/zhang/...` 换台机器即废，统一用相对路径加环境变量。
-- **写成教程**。"如何安装 node"属于 README；tools.md 只回答"有没有、什么版本、怎么验证"。
-- **放任 agent 自动追加**。每次运行都把新发现的工具写回去，几轮之后文件自相矛盾。变更必须过人。
+- **别写成散文**。Agent 的上下文按 token 计价，500 字的工具介绍不如三行结构化条目。
+- **警惕双源**。MCP 配置和 tools.md 各写一份、改一漏一，是最典型的“排障半小时、改行五秒钟”事故。要么合并，要么明确声明谁是源。
+- **跨平台路径**。Windows 反斜杠、空格引号问题很烦，建议在 tools.md 里直接约定“路径一律正斜杠 + 引号”。
+- **别指望 Agent 自己探索**。显式声明“这个工具在本环境不可用”，比让它试错省得多。
+- **`.gitignore` 先行**。先写忽略规则再建 `tools.local.md`，顺序反了一次 commit 就把内网地址推上远端了。
 
 ## 可复用建议
 
-- 每条记录尽量带一行自检命令，agent 先验证再使用，减少"想当然"。
-- 定期让 agent 做环境审计：输出它理解的工具清单，和你自己的认知 diff 一次，漂移早暴露。
-- 环境事实（tools.md）和环境变更（安装脚本）分离，文档不背执行的锅。
-- 团队场景下把 tools.md 纳入 code review：环境约定和代码约定同等对待。
+- 五段模板（工具清单 / 环境矩阵 / preflight / 密钥引用 / 本机覆盖说明）团队统一，新人 onboarding 从“填 local 覆盖”开始，而不是翻 wiki。
+- 每次大版本做一次“文档对账”：逐条执行 tools.md 里的命令和检查，失效即修。
+- 环境矩阵有新维度（新增一台构建机、换容器基础镜像）时，先改矩阵再动环境。
 
 ## 总结
 
-tools.md 本质上是把环境知识从口口相传变成单一事实源。它不解决"装环境"的问题，只解决"认识环境"的问题——让 agent 少猜、少错、少烧上下文。维护成本很低，收益随机器和协作者数量线性增长，属于典型的低成本高杠杆动作，建议每个跑 agent 的仓库都配一份。
+tools.md 的本质，是把“我这台机器和你的不一样”从运行时排障前移到文档层。原则就三条：**单一事实源、分层隔离本机差异、声明可验证的检查命令**。做到这三条，Agent 工具调用的成功率会有肉眼可见的改善，任何人接手环境也不需要口口相传。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/093161cee05a682c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/3f798e2088be1580.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/236210f7a0f41555.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/26ba7f8d7c9b6b6d.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/8403c7c5c48287de.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-10/970f84059130460f.png)
 
