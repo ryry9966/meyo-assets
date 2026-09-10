@@ -1,80 +1,77 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 36954
+feedId: 36960
 source: 综合讨论
 publishedAt: 2026-09-11
 ---
 
 ## 背景
 
-Agent 用得越久，能力清单越长，system prompt 就越臃肿。早期常见做法是把所有工具说明、操作规范一次性塞进上下文，结果是 token 占用高、注意力被稀释，真正常用的指令反而容易被淹没。OpenClaw 的 Skills 机制给出的是另一种思路：把能力拆成独立的技能包，会话启动时只注入几十字的元信息，模型判断当前任务命中后，才加载完整说明。
+OpenClaw 的 agent 跑久了都会遇到同一个矛盾：能力越多，system prompt 越长。早期做法是把所有工具说明、工作流、领域知识全塞进系统提示或 `AGENTS.md`，结果上下文里大部分内容在具体会话中根本用不上——token 开销固定，模型注意力还被无关指令稀释。
 
-## 机制：三级渐进加载
+Skills 是对这个问题比较工程化的回答，核心思路是**渐进式披露**：平时只驻留一行元数据，任务匹配时才加载完整说明。
 
-OpenClaw 的 skill 本质是一个目录，核心是一个 `SKILL.md` 文件，加载分三级：
+## 问题拆开看
 
-1. **元信息层**：启动时只有 name 和 description 进入上下文，成本几乎可以忽略；
-2. **正文层**：当用户请求与某个 description 匹配时，agent 主动读取该 skill 的 SKILL.md 全文；
-3. **资源层**：正文中引用的脚本、模板、参考文档，只有在执行时才被打开。
+1. **上下文膨胀**：十几个常驻说明文档，每个会话都带着全量开销；
+2. **触发混乱**：模型分不清哪段指令在什么场景下生效；
+3. **复用困难**：同一套流程在多个 workspace 复制粘贴，改一处漏三处。
 
-这就是渐进式披露（progressive disclosure）——上下文里永远只放"当前需要的那一层"。
+## Skills 怎么工作
 
-一个最小可用的 skill 长这样：
+加载分三层：
 
-```
-skills/log-analyzer/
-├── SKILL.md
-├── scripts/scan.py
-└── references/patterns.md
-```
+- **第一层**：启动时只读取每个 skill 的 `name` + `description`，几十 token；
+- **第二层**：任务匹配某 skill 的 description 时，才读入 `SKILL.md` 正文；
+- **第三层**：正文里引用的 `references/*.md`、`scripts/*`，用到才加载或执行。
 
-```markdown
+### 实操步骤
+
+1. 建目录 `~/.openclaw/skills/weekly-report/`（或 workspace 级 `.openclaw/skills/`）；
+2. 写 `SKILL.md`，frontmatter 里的 description 是触发关键，要写成"什么时候用我"：
+
+```yaml
 ---
-name: log-analyzer
-description: 分析服务日志、定位错误模式。当用户要求排查报错、
-统计错误频率或提取堆栈时使用。
+name: weekly-report
+description: 当用户要求生成周报、汇总本周提交与待办时使用。不适用于日报或会议纪要。
 ---
-
-# 日志分析
-1. 优先运行 scripts/scan.py，不要手写正则
-2. 输出超过 200 行时，写入文件后只汇报摘要
-3. 常见报错模式见 references/patterns.md
 ```
 
-## 实操步骤
+3. 正文只写流程性指令：输入、步骤、输出格式、边界情况。长参考资料拆到 `references/`，可自动化的步骤写成 `scripts/*.sh` 并 `chmod +x`；
+4. 重启 gateway 或热加载后验证：问一句"你现在有哪些技能"，或查 debug 日志确认注入列表。
 
-1. 在 workspace 的 `skills/` 目录下新建技能文件夹，放入带 frontmatter 的 SKILL.md；
-2. description 用"用户会怎么提需求"的口吻写触发条件，而不是罗列功能；
-3. 正文控制在几十行内，长细节、大表格全部外置到 `references/`；
-4. 固定操作写成脚本放进 `scripts/`，让 skill 指向脚本而不是复述步骤；
-5. 重启会话后确认 skill 已被识别，再拿几个真实请求验证命中情况。
+### 与 MCP 的关系
+
+Skill 注入的是"怎么做的知识"，实际执行仍依赖 MCP 工具或本机命令。典型分工：MCP 提供 API 调用能力，Skill 描述调用时序和容错策略。两者是互补，不是替代。
 
 ## 踩坑点
 
-- **description 写成功能说明书**。写"支持日志解析、正则提取、统计报表"，模型很难把它和"帮我看看昨天为什么报错 500"关联起来。要写触发场景，不是写能力清单。
-- **把细节全塞进正文**。SKILL.md 写了三百行，等于变相回到全量注入，渐进加载就失效了。
-- **脚本路径写死、没有可执行权限**。skill 换台机器跑不起来，多数是这两个原因。
-- **多个 skill 的 description 语义重叠**，导致误触发或互相抢占。一个 skill 只做一件事，边界模糊时宁可拆开。
-- **改完不重载会话**，以为没生效，其实跑的还是旧上下文。
+- **description 写成名词短语**（"周报工具"）→ 永远不触发。必须写成触发条件句式；
+- **description 太宽泛**（"帮助你完成任何任务"）→ 常驻加载，等于白做；
+- **SKILL.md 几百行不分层** → 触发即爆上下文，细节一律下沉到 `references/`；
+- **脚本路径写死绝对路径、没给执行权限** → 换台机器就挂，用相对路径；
+- **全局级与 workspace 级同名冲突**，注意加载优先级，调试时先确认实际生效的是哪份；
+- **误以为 skill 能新增执行能力**——不能。工具靠 MCP/插件，skill 只是"说明书"。
 
 ## 可复用建议
 
-- description 是整个机制里杠杆最大的一行字，值得反复打磨：包含"做什么 + 什么时候用"。
-- 把 skill 当成"给 agent 的 README"来维护，而不是 prompt 仓库。
-- 定期审计：让 agent 汇报各 skill 的命中频率，长期不命中的要么改描述，要么删掉。
-- 团队协作时，skill 目录直接进 git，走 review 流程管质量，比口头约定可靠。
+- 一个 skill 只做一件事，宁可拆小再组合；
+- description 按"触发场景 + 覆盖范围 + 排除项"三段写；
+- 脚本保持确定性（固定输入输出），把判断留给模型；
+- skills 目录进 git，团队维护一个共享仓库，新人克隆即用；
+- 定期审计日志：从未触发的 skill，大概率是 description 写偏了。
 
 ## 总结
 
-Skills 机制没有黑魔法，它只是把 prompt 工程文件化、分层化、按需化。真正的难点不在机制本身，而在描述词的质量和职责边界的划分。建议先用两三个高频场景练手，把 description 打磨到位，再逐步扩充——比一次写几十个 skill 再回来返工划算得多。
+Skills 的本质不是给 agent 新增能力，而是**重新组织上下文**：让模型在正确的时刻读到正确的说明书。我们实践下来，常驻 prompt 砍掉约七成，长任务的稳定性反而更好——干扰信息少了，模型执行既定流程的准确率自然上去。建议从一两个高频流程开始试点，跑顺了再逐步铺开。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/000c16eb63e63148.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/93e95a585d4ca321.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/6314c9afd373589e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/5efd2b633ffaebc1.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/e162b61ede902ae2.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/c256071067a89490.png)
 
