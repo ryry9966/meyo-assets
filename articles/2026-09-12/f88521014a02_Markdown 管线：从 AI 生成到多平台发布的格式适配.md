@@ -1,59 +1,60 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 37116
+feedId: 37143
 source: 综合讨论
 publishedAt: 2026-09-12
 ---
 
 ## 背景
 
-在 OpenClaw 的自动化场景里，让 Agent 产出内容只是第一步。真正麻烦的是后半程：同一段 Markdown，发公众号要转内联样式 HTML，发知乎会被吞表格，发静态站又要处理 frontmatter 和相对路径。我们团队把这条链路收敛成了标准管线，本文记录设计与踩坑。
+在 OpenClaw 的典型工作流里，Agent 的写作产出几乎都是 Markdown：MCP 工具返回的报告、定时任务生成的周报、插件产出的文档。但"写成 Markdown"和"发出去能看"之间隔着一条鸿沟——公众号要全内联样式的 HTML，知乎吃自家编辑器那套，静态站要 front matter，掘金、Dev.to 又各有一套方言。多数人的做法是每个平台手工调一遍格式，内容一更新，全部重来。
 
 ## 问题
 
-LLM 输出的 Markdown 看似规范，差异集中在三类：
+拆开看，真正的痛点有三个：
 
-1. **结构不稳定**：标题层级跳级、把整段输出包进代码围栏、frontmatter 字段漂移；
-2. **语法超集**：脚注、任务列表、内联 HTML、KaTeX 公式——这些不是所有渲染端都认；
-3. **中文排版**：CJK 与西文之间无空格、全半角标点混用，以及一个经典 bug：`**加粗**` 紧贴中文字符时，部分 CommonMark 实现因 flanking 规则不渲染。
-
-下游平台再各自加一层限制。所以问题不是“有没有 Markdown”，而是“是哪一种 Markdown”。
+1. **LLM 输出不可控**。模型随手堆三四级标题、裸 HTML 标签、不规范的表格，下游渲染直接崩。
+2. **平台方言不一致**。CommonMark、GFM、各家私有扩展，同一份源文件渲染结果差异很大。
+3. **发布不可重放**。改个错别字就要全平台重新粘贴，没有幂等性。
 
 ## 做法
 
-管线分四层，核心思想：**把 Markdown 当 AST 处理，而不是当字符串**。
+我的思路是把 Markdown 当成中间表示（IR），发布当成编译，每个平台一个后端：
 
-1. **生成约束层**。在 Agent 的 system prompt 里固定输出协议：标题只允许二级以下、禁用内联 HTML、frontmatter 字段白名单、代码块语言限定在 whitelist。约束生成端永远比修复下游便宜。
-2. **归一化层**。用 unified/remark 做 mdast 级 transform：统一标题层级、CJK 加空格（pangu 规则实现成 remark 插件）、为不支持的平台把脚注降级为文末引用列表、剥离危险标签。产出一份“内部规范 AST"。
-3. **适配层**。每个平台一个 adapter，输入都是归一化后的 AST：公众号走 remark-rehype 再内联样式，静态站直接序列化回 MD，知乎做表格降级。adapter 之间互不感知。
-4. **校验与分发层**。发布前跑 lint（markdownlint + 自定义规则）、死链检查、图片存在性检查，golden 文件做快照测试，通过后才交给发布插件或 MCP 工具（如 `publish_to(platform)`）。
+**第一步：收敛源头。** 在 Agent 的 system prompt 和输出 schema 里明确允许的 Markdown 子集：只用 H2/H3、标准列表、标准表格、fenced code block，禁止裸 HTML 和 footnote。源头约束比事后修复便宜十倍。
+
+**第二步：规范化层。** AI 输出先过 unified/remark 管线：markdownlint 校验、标题统一降级（H1 一律降为 H2）、图片链接转存图床、front matter 填充元数据。这一层的产出是"标准 Markdown"，之后所有平台只消费它。
+
+**第三步：平台适配器。** 每个适配器是纯函数：`render(markdown, theme) → output`。公众号适配器把 Markdown 转成全内联样式的 HTML（公众号会剥掉 `<style>` 标签），主题是 JSON 配置的样式 token；静态站适配器直接透传标准 Markdown 加 front matter；知乎走 API 或剪贴板富文本。
+
+**第四步：发布工具化。** 每个适配器包成 MCP tool 或插件命令，发布前对内容做 hash，hash 未变就跳过，实现幂等。
 
 ## 踩坑点
 
-- **正则修格式迟早出事**。嵌套代码块里的 "```" 会骗过文本级替换，改用 AST 后才稳定。
-- **中英文加粗渲染不一致**。部分渲染器对 CJK flanking 处理不同，我们的方案是在归一化层统一转 `<strong>`（仅目标平台允许 HTML 时），adapter 层做开关。
-- **图片相对路径**。Agent 生成的相对路径发布即死链，归一化层强制转绝对 URL 并校验可达。
-- **frontmatter 里的冒号**。标题含 `：` 未加引号会解析失败，靠 lint 规则兜底。
-- **公式双方言**。KaTeX 和知乎公式语法不同，别指望一处渲染处处可用，adapter 里各写一遍转换。
+- **公众号外链**：正文外链不可点。我的处理是在规范化层自动转成文末参考列表（编号 + 纯文本 URL）。
+- **表格溢出**：移动端列多必炸，规范层限制最多 3 列，超出的自动转列表。
+- **嵌套列表缩进**：2 空格和 4 空格在不同渲染器表现不同，remark 统一成 4 空格。
+- **代码高亮**：公众号需要把 highlight.js 输出转成带内联颜色的 span，直接贴 CSS 类是无效的。
+- **图片防盗链**：内容发到知乎后图片 403，管线里加一步图片转存再改写 URL，别依赖源站。
 
 ## 可复用建议
 
-- 写一份“AI 输出 Profile”，贴进所有内容生成 Agent 的 prompt，全管线共用一份。
-- adapter 保持纯函数：AST 进、格式出，不碰网络不碰文件，方便单测。
-- 每个平台留 2–3 个 golden 样例，CI 里做 diff，平台编辑器改版第一时间能发现。
-- 把适配能力包成 MCP tool，Agent 就能自己决策“这篇发哪、怎么发”。
+1. 先写一页"格式契约"文档，明确允许的 Markdown 子集，给 Agent 和人都看。
+2. 每个适配器配 golden file 快照测试，防止样式 token 改动引发回归。
+3. 主题与内容分离，全部样式 token 收进一个 JSON。
+4. 别追求覆盖所有语法，子集越小，管线越稳。
 
 ## 总结
 
-多平台发布的核心不是写更多转换代码，而是**收敛源头 + AST 中间表示 + 平台隔离**。把格式适配从“每个脚本各修各的”变成一条可测试的管线后，新增平台基本只是多写一个 adapter 文件的事。
+Markdown 管线的本质是"一次生成、多端编译"。把约束放在源头，把差异关进适配器，把发布做成幂等工具，AI 的产出才能真正一键分发，而不是每换一个平台就重新劳动一次。这套思路不绑定任何具体框架，用 remark、markdown-it 或者自己写解析都成立，核心是分层和纯函数。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/628bac4fdd93206d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/1e14d9735c9f12da.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/ca9f59749b9ba951.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/f0d6dd63a8769ad2.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/7e106e7a4ec7c976.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/07707bec36b703a2.png)
 
