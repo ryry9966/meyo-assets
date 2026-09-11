@@ -1,77 +1,78 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 36960
+feedId: 37053
 source: 综合讨论
 publishedAt: 2026-09-11
 ---
 
 ## 背景
 
-OpenClaw 的 agent 跑久了都会遇到同一个矛盾：能力越多，system prompt 越长。早期做法是把所有工具说明、工作流、领域知识全塞进系统提示或 `AGENTS.md`，结果上下文里大部分内容在具体会话中根本用不上——token 开销固定，模型注意力还被无关指令稀释。
+给 Agent 接能力的常见做法是把所有工具一口气挂上：MCP server 全开、插件全装、系统提示词里塞满说明。能力多到一定程度，模型开始"选错工具"，上下文成本也跟着涨。OpenClaw 的 Skills 机制走的是另一条路：技能平时在提示词里只占一行"名字 + 一句描述"，当任务真正匹配时，完整的 SKILL.md 正文才会被加载进上下文——典型的渐进式披露（progressive disclosure）。
 
-Skills 是对这个问题比较工程化的回答，核心思路是**渐进式披露**：平时只驻留一行元数据，任务匹配时才加载完整说明。
+## 问题
 
-## 问题拆开看
+我们在做一个内部数据助手时，最初挂了十几个 MCP 工具，外加一份两万字的说明文档，结果：
 
-1. **上下文膨胀**：十几个常驻说明文档，每个会话都带着全量开销；
-2. **触发混乱**：模型分不清哪段指令在什么场景下生效；
-3. **复用困难**：同一套流程在多个 workspace 复制粘贴，改一处漏三处。
+- 系统提示词常驻 8k+ tokens，每轮对话都在为用不到的能力付费；
+- 模型经常把"查数据库"和"跑 Python 脚本"两个工具混用；
+- 环境里没配 API key 的工具照样暴露给模型，一调用就报错。
 
-## Skills 怎么工作
+## 做法
 
-加载分三层：
+Skills 的本质是用文件系统组织能力包，最小单元是一个目录加一个 SKILL.md：
 
-- **第一层**：启动时只读取每个 skill 的 `name` + `description`，几十 token；
-- **第二层**：任务匹配某 skill 的 description 时，才读入 `SKILL.md` 正文；
-- **第三层**：正文里引用的 `references/*.md`、`scripts/*`，用到才加载或执行。
-
-### 实操步骤
-
-1. 建目录 `~/.openclaw/skills/weekly-report/`（或 workspace 级 `.openclaw/skills/`）；
-2. 写 `SKILL.md`，frontmatter 里的 description 是触发关键，要写成"什么时候用我"：
-
-```yaml
+```markdown
 ---
-name: weekly-report
-description: 当用户要求生成周报、汇总本周提交与待办时使用。不适用于日报或会议纪要。
+name: csv-report
+description: Generate weekly CSV summary reports from local data.
+  Use when the user asks for data exports or weekly summaries.
+metadata:
+  requires:
+    bins: ["python3"]
 ---
+
+# CSV Report
+
+1. 读取 ./data/ 下的原始文件
+2. 执行 scripts/build_report.py，参数为目标周
+3. 输出到 ./reports/，命名 YYYY-Www.csv
+
+字段映射细节见 references/schema.md，按需读取。
 ```
 
-3. 正文只写流程性指令：输入、步骤、输出格式、边界情况。长参考资料拆到 `references/`，可自动化的步骤写成 `scripts/*.sh` 并 `chmod +x`；
-4. 重启 gateway 或热加载后验证：问一句"你现在有哪些技能"，或查 debug 日志确认注入列表。
+三个关键点：
 
-### 与 MCP 的关系
-
-Skill 注入的是"怎么做的知识"，实际执行仍依赖 MCP 工具或本机命令。典型分工：MCP 提供 API 调用能力，Skill 描述调用时序和容错策略。两者是互补，不是替代。
+1. **description 是路由键。** 模型只靠这一句决定是否加载正文，所以要用第三人称写清"什么场景用"，而不是堆关键词。
+2. **正文保持轻。** 长文档放到 references/ 之类的附属文件，SKILL.md 里只写路径引用，用到才读。
+3. **放对位置。** 工作区 skills 目录（如 `~/.openclaw/workspace/skills`）优先级最高，可覆盖内置同名技能，改动即时生效，无需重启。
 
 ## 踩坑点
 
-- **description 写成名词短语**（"周报工具"）→ 永远不触发。必须写成触发条件句式；
-- **description 太宽泛**（"帮助你完成任何任务"）→ 常驻加载，等于白做；
-- **SKILL.md 几百行不分层** → 触发即爆上下文，细节一律下沉到 `references/`；
-- **脚本路径写死绝对路径、没给执行权限** → 换台机器就挂，用相对路径；
-- **全局级与 workspace 级同名冲突**，注意加载优先级，调试时先确认实际生效的是哪份；
-- **误以为 skill 能新增执行能力**——不能。工具靠 MCP/插件，skill 只是"说明书"。
+- **description 写成关键词堆砌**：技能要么永远不触发，要么乱触发。写成 "Use when the user asks for X" 这种句式后，触发率明显更稳。
+- **和内置技能重名**：重名会覆盖内置版本。排查问题时容易误判为官方逻辑问题，其实是自己的同名文件在生效。
+- **技能数量失控**：五六十个技能的"索引"本身也会撑大提示词。建议先合并同类，再做加法。
+- **门控没配**：环境变量或二进制缺失时技能会"半可用"，在 `metadata.requires` 里提前声明 bins/env，Agent 会直接跳过。
+- **写死绝对路径**：换台机器就断。脚本和文档统一用相对路径，跟着技能目录走。
+- **密钥写进 SKILL.md**：这是会被注入上下文的，密钥一律走环境变量加门控。
 
 ## 可复用建议
 
-- 一个 skill 只做一件事，宁可拆小再组合；
-- description 按"触发场景 + 覆盖范围 + 排除项"三段写；
-- 脚本保持确定性（固定输入输出），把判断留给模型；
-- skills 目录进 git，团队维护一个共享仓库，新人克隆即用；
-- 定期审计日志：从未触发的 skill，大概率是 description 写偏了。
+- 一个技能一个能力，粒度宁粗勿细；
+- 把跑通的内置技能当结构模板来抄；
+- 技能目录进 git，多设备同步，改动可回溯；
+- 定期用 `openclaw skills list` 核对实际加载了哪些技能，别凭感觉。
 
 ## 总结
 
-Skills 的本质不是给 agent 新增能力，而是**重新组织上下文**：让模型在正确的时刻读到正确的说明书。我们实践下来，常驻 prompt 砍掉约七成，长任务的稳定性反而更好——干扰信息少了，模型执行既定流程的准确率自然上去。建议从一两个高频流程开始试点，跑顺了再逐步铺开。
+Skills 不是新魔法，本质就是"提示词侧的懒加载 + 文件化的能力打包"。真正决定体验的是两件事：description 写得准不准，以及你有没有克制地控制技能总量。把路由交给描述、把细节交给文件之后，上下文省下来了，工具选择的准确率反而是我们上线 Skills 后提升最明显的指标。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/93e95a585d4ca321.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/be17d5623a857568.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/5efd2b633ffaebc1.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/7020029c7b84ab4b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/c256071067a89490.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-11/1fa1a725f819f08a.png)
 
