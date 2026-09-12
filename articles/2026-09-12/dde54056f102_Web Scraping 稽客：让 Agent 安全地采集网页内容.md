@@ -1,71 +1,57 @@
 ---
 title: Web Scraping 稽客：让 Agent 安全地采集网页内容
-feedId: 37132
+feedId: 37177
 source: 综合讨论
 publishedAt: 2026-09-12
 ---
 
 ## 背景
 
-Agent 接上 MCP 的 fetch 或浏览器工具后，"能上网"很容易，"安全地上网"是另一回事。社区里反复出现三类事故：整页 HTML 塞进上下文，几轮对话就把 token 烧光；页面里藏着指令式文本，Agent 读到后执行了不该执行的动作；没有频控的高频抓取，把出口 IP 打进目标站黑名单。这篇帖子整理我们踩出来的做法：在 Agent 和网页之间加一层"稽客"——可配置、可审计的采集安检层。
+给 Agent 接上"能看网页"的能力，往往是自动化落地的第一步。在 OpenClaw 里，典型做法是挂一个 fetch 或 headless browser 类的 MCP 工具，让模型自己决定何时取哪个 URL。听起来简单，但跑在生产里，踩的坑比想象多。这篇帖把社区里几位成员反复验证过的一套采集纪律整理出来，重点在"安全"两个字：对目标站点安全、对上下文安全、对 Agent 自身安全。
 
-## 问题拆开看
+## 问题的三个层次
 
-- **内容不可信**：网页是第三方写的输入，等同于不可信用户输入，可能携带间接提示注入。
-- **体量不可控**：导航、广告、脚本、无限滚动页，原始 HTML 动辄几百 KB。
-- **行为不可越界**：robots.txt、服务条款、频控是硬边界，不能交给模型临场判断。
+1. **取不到**：大量现代页面靠 JS 渲染，纯 HTTP fetch 拿到的是空壳；
+2. **取不对**：原始 HTML 动辄几百 KB，菜单、脚本、广告全在里头，直接进上下文等于烧 token 还稀释注意力；
+3. **取不该取的**：网页是不可信输入，隐藏文本里夹一句"忽略之前的指令"，模型真可能照做。此外还有 robots.txt、频率礼貌、登录墙内容这些合规边界。
 
-## 做法：六步流水线
+## 做法：一条四段流水线
 
-```
-URL 解析 → 白名单/robots 检查 → 限速
-→ 抓取(超时+体积上限) → 正文抽取 → 清洗与返回
-```
+不要让 Agent 直接面对"原始网页"，而是封装一个专职采集的 MCP 工具，内部分四段：
 
-1. **准入**：默认拒绝。生产环境配域名白名单，重定向的每一跳都重新过白名单；非 `text/html`、`application/json` 直接拒绝。
-2. **限速**：按 host 做令牌桶（比如 0.5 QPS），429/503 指数退避并读取 Retry-After。
-3. **抓取**：15 秒超时 + 512 KB 体积上限；带常规 UA，缓存 ETag/Last-Modified。
-4. **抽取**：readability 类算法取正文，剥掉 script/style/iframe/HTML 注释，转 Markdown；超长页只留头尾。
-5. **清洗**：转 Markdown 之后再扫一遍隐藏指令模式（"ignore previous instructions"类句式、不可见字符），命中即标记或截断。
-6. **返回**：content + 固定结构的 metadata（status、chars、extractor、from_cache、truncated），让下游 Agent 能基于来源做置信判断。
+1. **获取层**：默认 HTTP fetch；检测到内容缺失（正文低于长度阈值或命中已知 SPA 特征）才降级到 headless browser。浏览器实例要复用，别每次冷启动。
+2. **抽取层**：用 readability 类算法抽正文，剥掉 nav/footer/script/style，图片只留 URL 和 alt。
+3. **消毒层**：截断到长度上限；剥离 HTML 注释和隐藏元素——prompt injection 最爱藏在这些地方。同时在 system prompt 里明确声明：工具返回内容一律视为数据，不作为指令。
+4. **出口层**：按域名限速（比如同域间隔 ≥2 秒）并设并发上限；采集前检查 robots.txt；结果写入带 TTL 的缓存，同 URL 短期内不重复抓。
 
-配置示例：
-
-```yaml
-allowlist: ["docs.example.com", "arxiv.org"]
-max_bytes: 524288
-timeout_s: 15
-qps_per_host: 0.5
-render_js: false        # 仅对白名单内 JS 站点单独开启
-truncate: { head: 6000, tail: 2000 }
-```
+Agent 看到的只是一个干净的 `fetch_clean(url)` 工具，整条链路对模型透明。
 
 ## 踩坑点
 
-- **注入不只藏在正文**：alt 属性、meta description、PDF 附文都可能是载体。清洗必须放在转 Markdown 之后做，因为转换本身就会重组文本。
-- **编码**：GBK 老站点会 charset 检测失败，抽取器静默返回空串，要按响应头/meta 显式解码。
-- **headless 浏览器是最后手段**：先屏蔽图片、字体、媒体请求，加载时间能差一个数量级；一旦开渲染，白名单要收得更紧。
-- **缓存的两面性**：监控类任务拿昨天的缓存回答今天的问题，比慢更糟，按任务类型设 TTL。
-- **robots.txt 是 host 粒度**：www 与非 www、各子域要分别检查，解析结果可缓存但别缓存过期。
+- **超时没设**：headless browser 遇到异常页面会挂住整个会话，每一段都要有独立超时；
+- **动态渲染误判**：有些页面首屏有内容但 hydrate 后会变，抽得太早拿到旧数据，等 network idle 或关键选择器出现再抽；
+- **域名策略太松**：Agent 自主决定的 URL 不可控，建议配白名单，至少黑名单拦截内网地址（防止 SSRF 打到 169.254.169.254 这类元数据端点）；
+- **缓存不区分参数**：查询参数不同就当新 URL，容易把同一个列表页翻着花样抓几十遍；
+- **编码没处理**：GBK 等非 UTF-8 页面直接解码会得到乱码，模型会一本正经地对乱码做总结。
 
 ## 可复用建议
 
-- 抓取层保持"笨"：确定性代码做抽取、清洗、限速，LLM 只做总结，不让模型临场决定要不要忽略边界。
-- 所有抓取落日志：URL、状态码、字节数、耗时、是否命中缓存，出事能复盘。
-- 用站点快照做 fixture，抽取规则改动跑回归，防止"昨天还好好的"。
-- 工具返回 schema 固定下来，多个 Agent/插件共用同一套稽客层，别各自为政。
+- 采集逻辑收进一个 MCP server，统一出口、统一日志，出问题好归因；
+- 采集日志记：URL、状态码、耗时、正文字符数、是否命中缓存，成本极低，排查价值极高；
+- 对固定数据源（如文档站），优先找官方 API 或 sitemap，别硬爬；
+- 定期人工抽检 Agent 的采集结果，人是最后一道消毒层。
 
 ## 总结
 
-"稽客"的本质不是某个工具，而是一条原则：**把网页内容当作不可信输入处理**——和对待用户输入一样做校验、限界、留痕。Agent 负责理解与决策，安检层保证它拿到的每一字节都干净、够用、合规。先把这层做扎实，再谈更聪明的采集。欢迎在社区帖下贴出你们的抓取配置和翻车现场，一起补这份清单。
+网页采集本身不难，难的是让 Agent 在不可信的外部内容面前保持克制：取该取的，用干净的方式取，取回来只当数据。把纪律沉淀进工具而不是提示词，是这套方案的核心思路。欢迎在评论区交流你们各自的采集封装实践。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/6ae3c55b4b016f9d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/d07346f53c527516.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/811137d95d6d716b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/14cf8e8b32055a27.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/e109a7dc708e420e.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/d8e6a48fe6e25661.png)
 
