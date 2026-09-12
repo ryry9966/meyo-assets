@@ -1,67 +1,71 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 37189
+feedId: 37191
 source: 综合讨论
 publishedAt: 2026-09-12
 ---
 
 # 背景
 
-做 Agent 开发经常遇到一个场景：模型本身能力没问题，卡在"接工具"上。想让它读写本地文件、查数据库、调内部 API，每接一个就要写一套 function calling schema、一套鉴权、一套错误处理。换个宿主框架，这些代码基本要重写一遍。
+做 Agent 应用一年多，最重复的劳动其实不是写 prompt，而是写胶水代码：让 Agent 查数据库、调内部 API、抓网页、操作文件系统。每个宿主——IDE 插件、CLI 工具、聊天客户端——都要各自实现一遍，且互相不通。2024 年底 Anthropic 放出 MCP（Model Context Protocol），定位是"AI 应用的 USB-C 接口"，现在主流 Agent 框架和编辑器都已原生支持。
 
-这就是 MCP（Model Context Protocol）要解决的背景问题。它由 Anthropic 于 2024 年底开源，定位很克制：一套让 LLM 应用与外部工具、数据源通信的开放协议。可以粗略理解为"AI 应用的 USB-C 接口"。
+# 它到底解决了什么
 
-# 之前的问题到底是什么
+核心是 **M×N 集成问题**：M 个模型应用 × N 个数据源/工具，传统做法要写 M×N 个适配器。MCP 把它压成 M+N——应用只实现一次 MCP Client，工具方只实现一次 MCP Server，中间靠标准协议通信。
 
-核心是组合爆炸。假设有 M 个 AI 应用、N 个工具/数据源，点对点集成的成本是 M×N，而且每条边都要重复解决同一批问题：
+另一个被低估的点：function calling 是各家模型的私有协议，MCP 是应用层协议，与具体模型解耦。换底座模型不用重写工具层，这对长期维护很关键。
 
-1. **工具描述格式不统一**：各家 function calling schema 细节都有差异；
-2. **鉴权各搞各的**：同一个 GitHub 工具，应用 A 用 PAT，应用 B 用 OAuth，应用 C 干脆内置；
-3. **能力发现靠硬编码**：新加一个工具，宿主应用要发版才能用上；
-4. **上下文传递没有规范**：工具返回的数据怎么裁剪、怎么分页，全靠各应用自己拍脑袋。
+概念上只有三个角色：
 
-MCP 的一句话总结就是把这个成本从 M×N 压到 M+N：工具方只需实现一次 MCP Server，任何支持 MCP 的客户端都能直接用。
+- **Host**：Agent / 客户端本体
+- **Client**：Host 内管理一条与 Server 的连接
+- **Server**：对外暴露能力
 
-# MCP 的做法
+Server 暴露三类原语：`tools`（可执行动作）、`resources`（可读数据）、`prompts`（预置模板）。底层是 JSON-RPC 2.0，传输层常用 stdio（本地子进程）和 Streamable HTTP（远程服务）。
 
-协议基于 JSON-RPC 2.0，架构是标准的 Client-Server：
+# 动手：最小可用的 Server
 
-- **Host**：你的 Agent 应用，内部跑 MCP Client；
-- **MCP Server**：独立进程，暴露三种原语，Tools（模型可调用的动作）、Resources（可读取的数据）、Prompts（预置提示模板）；
-- **传输层**：本地用 stdio，远程用 Streamable HTTP，远程场景走 OAuth 2.1 鉴权。
+以 Python SDK 为例，十几行就能跑：
 
-# 上手步骤
+```python
+from mcp.server.fastmcp import FastMCP
 
-1. **选 SDK**：官方有 TypeScript 和 Python SDK，Python 版 `pip install mcp` 即可；
-2. **写最小 stdio Server**：用 `@mcp.tool()` 装饰器暴露一两个函数，比如查询内部服务状态；
-3. **单独调试**：先用官方 Inspector（`npx @modelcontextprotocol/inspector`）验证工具能被发现、被调用，再接入 Agent；
-4. **再考虑远程化**：确认确实需要多客户端共享后，才迁移到 HTTP + OAuth，别一上来就做远程。
+mcp = FastMCP("demo-ops")
+
+@mcp.tool()
+def get_order(order_id: str) -> dict:
+    """按订单号查询订单，返回状态、金额与物流信息。"""
+    return db.query_order(order_id)
+```
+
+把它写进客户端配置、重启会话，模型即可自主发现并调用。调试用官方 MCP Inspector，比盯日志快得多。
 
 # 踩坑点
 
-- **工具描述质量决定调用成功率**：模型是靠 description 选工具的。写得含糊，模型要么不调用，要么乱传参数。把它当成写给初级工程师的 API 文档来写。
-- **返回值撑爆上下文**：一个工具直接吐 5000 行 JSON，几轮对话就把窗口吃光。裁剪、分页、摘要要放在 Server 端做。
-- **错误处理要"给模型看的"**：抛堆栈没有意义，返回结构化的错误信息和补救建议，模型才有自我修正的余地。
-- **提示注入风险真实存在**：工具返回内容会进入模型上下文，外部数据源里的恶意指令会被当真。高危工具务必加人工确认环节。
-- **SDK 版本协商问题**：协议演进很快，Client 和 Server 的 SDK 版本差异会导致 initialize 握手失败。排查时先对齐版本，再看别的。
+1. **工具描述就是 prompt。** 模型选不选某个工具，几乎完全取决于 description 清不清楚，参数用 enum 约束比事后校验有效得多。
+2. **stdio 环境问题。** 本地 Server 是子进程，PATH、虚拟环境、Windows 编码都会导致"连接失败"。先在终端手动跑一遍启动命令再排查配置。
+3. **同步阻塞。** Server 里写同步 HTTP 调用会卡住整个会话的消息循环，耗时操作务必 async 或丢后台任务。
+4. **权限与注入。** 工具参数由模型填充，本质是不可信输入。文件路径、shell 命令做白名单；写操作默认要求人工确认，不要无脑 auto-approve。
+5. **协议版本。** 早期教程里的 HTTP+SSE 传输已被 Streamable HTTP 取代，照抄旧文容易连不上。
 
 # 可复用建议
 
-- **工具粒度宁粗勿细**：与其暴露 20 个细粒度接口，不如封装 5 个贴合业务动作的工具，降低模型的决策负担；
-- **接 Agent 前先用脚本压测 Server**：Inspector 或裸 JSON-RPC 脚本跑通再上 Agent，排障半径小很多；
-- **给每次工具调用留日志**：参数、返回、耗时全记下来。经验上 90% 的"模型不干活"，最后查出来是 Server 侧报错。
+- 一个 Server 只做一件事，工具粒度小而边界清晰；30 个清晰的小工具好过 10 个万能大工具。
+- 把工具列表当 prompt 资产维护，纳入 code review。
+- 每个 Server 配一个 Inspector 冒烟脚本，升级 SDK 后先跑一遍再上线。
+- 锁定 SDK 版本，MCP 规范仍在快速迭代，语义变化不罕见。
 
 # 总结
 
-MCP 解决的不是模型能力问题，而是集成工程问题：把 M×N 的适配成本压到 M+N。它不神秘，本质是一套带能力发现和标准传输的 RPC 规范。如果你的 Agent 只接一两个工具，手写 function calling 足够；一旦工具数量和宿主应用开始增长，标准化的收益就会很快显现。建议路径：从本地 stdio Server 起步，跑通一个真实业务工具，再评估是否值得远程化。
+MCP 没有引入新魔法，它只是把集成接口标准化了。但工程上标准化的价值经常被低估：一次实现、处处接入，工具生态从私有脚本走向可共享的组件。如果你的 Agent 正在维护第三份重复的"查数据库"代码，就值得迁过来了。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/3496106a047d4465.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/68585d3218b113bc.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/25d2da661209344e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/002271821fa280fa.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/9db701543f3bad44.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/759bacef08cf7e30.png)
 
