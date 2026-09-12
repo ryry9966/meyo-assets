@@ -1,69 +1,51 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 37102
+feedId: 37171
 source: 综合讨论
 publishedAt: 2026-09-12
 ---
 
 ## 背景
 
-OpenClaw 这类 Agent 框架依赖 markdown 注入运行上下文，`tools.md` 的职责是告诉 Agent：这台机器上有什么工具、怎么调、什么时候不能用。单人单机时随手写几行就能跑，但只要换一台电脑、或多个人协作同一份仓库，问题立刻暴露。
+Agent 的上下文每次会话都是空白的。你在这台机器上装过什么、路径改到哪了、哪个服务是手动起的，模型一概不知。OpenClaw 的 workspace 里给了 `tools.md` 这个入口：把"只有你知道的机器事实"写下来，让 agent 不用猜。把它当文档，很快就废；把它当环境契约，才能长期用。
 
 ## 问题
 
-典型故障有三种：
+同一个任务在不同机器上会走出不同的路：macOS 用 brew、Linux 用 apt；GPU 有没有；代理端口是 7890 还是没配；服务是 systemd 托管还是 nohup 裸奔。这些差异写死在 system prompt 里，换台机器就失效；靠会话里口头交代，每次都要重复；让 agent 自己探测，慢且容易猜错——它可能假设一个不存在的命令或路径，然后沿着错误前提一路跑下去。
 
-1. **路径写死**。`/usr/local/bin/ffmpeg` 在你的 mac 上存在，在同事的 Ubuntu 上是 `/usr/bin`，在容器里干脆没有。
-2. **环境不继承**。Agent 的执行环境往往不是你的交互 shell——由 systemd/launchd 拉起的进程拿不到 `.zshrc` 里的 PATH、代理和 conda 激活，连 `python` 和 `python3` 都可能找不到。
-3. **多处真相**。`tools.md`、MCP 配置、dotfiles 各写一份，改了 MCP 忘了 md，Agent 按过期信息调用，然后开始"现场发挥"。
+## 做法
 
-## 做法：拆成三层
-
-核心思路是把"约定"和"实例"分开：
-
-```text
-tools.md              # 入库：能力声明 + 调用契约，不含路径和秘密
-tools.local.md        # gitignore：本机实例，路径/版本/代理/GPU 状态
-scripts/preflight.sh  # 探测环境，生成并校验 local 文件
-```
-
-`tools.md` 里每个工具固定四个字段：
-
-```text
-- name: ffmpeg
-  check: ffmpeg -version
-  invoke: ffmpeg [args]
-  fallback: 不可用则报错退出，禁止用替代品拼凑
-```
-
-`tools.local.md` 由脚本生成：探测到 `/opt/homebrew/bin/ffmpeg`，就把绝对路径写进去。`preflight.sh` 在会话启动前跑一遍，逐个执行 `check`，任何一项失败直接阻止启动——而不是让 Agent 跑到一半才发现。
-
-Agent 侧约定两条：会话开始只读这两份文件；任何工具调用前先执行 `check`，禁止假设工具存在。
+1. **划定边界**。tools.md 只放两类内容：环境事实（OS、shell、包管理器、关键路径、端口）和操作约定（这台机器上优先怎么做、禁止做什么）。任务描述、项目笔记另找地方。
+2. **结构化分节**。建议固定四节：环境概览、常用路径、本地服务、禁区。每节三五条，宁可少而准。
+3. **分层管理**。跨机器通用的部分放 git 里的 base 模板，机器差异做成 per-host 片段，部署时用脚本拼装。不想搞拼装，就在 dotfiles 仓库按主机分文件，至少保证有版本记录。
+4. **控制长度**。tools.md 每次会话都会进上下文，是实打实的 token 成本。目标一页以内，写祈使句，不写散文。
+5. **可验证**。写一个 probe 脚本，输出机器可读的环境事实；定期让 agent 跑一遍并与 tools.md 做 diff，过期条目当 bug 修，而不是靠记忆。
 
 ## 踩坑点
 
-- **别写模糊描述**。"ffmpeg 大概在 /usr/local 下面"这种话 Agent 会当真，然后真的去那里找。要么精确，要么删掉。
-- **忘了 gitignore**。`tools.local.md` 里常有 API key 和内网地址，加一条 pre-commit 检查兜底。
-- **清单膨胀**。写了五十个工具，Agent 就会尝试五十个。只列当前工作流真正用到的，其余归档。
-- **与 MCP 双写漂移**。如果工具同时由 MCP server 提供，让生成脚本以 MCP 配置为单一来源产出 `tools.md` 对应段落，不要手工维护两份。
+- **秘密绝不入档**。API key、token 写进 tools.md 等于进了上下文和日志。只写变量名或密钥管理器的引用。
+- **三处漂移**。README、shell rc、tools.md 各写一份，两周后必然不一致。定好 single source：机器事实由 probe 生成，人的约定才手写。
+- **以为 agent 会"顺便"读**。确认你的注入配置确实加载了 tools.md；改完后开一个新会话，问一个只有文件里才有的事实，验证生效。
+- **会话内变更丢失**。agent 中途装了依赖、改了配置，没人回写。约定收尾动作：让 agent 汇报本次环境变更，人工判断是否入档。
 
 ## 可复用建议
 
-- 把 `preflight` 挂到 session start hook，做成"启动即校验"，比文档里写一句"请先检查环境"可靠得多。
-- 每个工具都写 `fallback`，明确不可用时的行为。压缩 Agent 自由发挥的空间，就是压缩事故面。
-- `tools.md` 的变更走 code review——它和接口定义同级，不该是某个人的本地笔记。
+- 把 tools.md 的改动当代码评审：diff 看一眼再合并，防止自动写入失控。
+- 只写机器可检查的内容：路径、命令、端口、版本号，少用"大概""通常"。
+- 新机器 onboarding 标准流程：跑 probe 出草稿 → 手工补约定 → 提交入库，十分钟内完成。
+- 禁区小节最值钱："这台机器不要全局 pip install"一句话，省掉一次环境炸掉。
 
 ## 总结
 
-`tools.md` 不是文档，是 Agent 与机器之间的接口契约。环境差异永远存在，正确的姿势不是消灭它，而是把它压缩到唯一一层（local 文件 + 生成脚本），让入库的部分保持通用、可校验、可 review。做到这一点，换机器的成本就从"排障半天"变成"跑一次脚本"。
+tools.md 的价值不在于写了多少，而在于每一条都对。把它当环境的状态文件来维护：事实自动生成、约定人工手写、变更走评审、秘密永不落盘。Agent 表现的上限，往往取决于它对环境的认知有多准——这份认知，值得你花一个下午认真整理。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/883f015384c578c3.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/78f783c7739fe64a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/d6373c66ea61a693.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/6308b86b49c9c509.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/b41333811ef7cdc4.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets@main/images/2026-09-12/ecff8ff1db7c444a.png)
 
